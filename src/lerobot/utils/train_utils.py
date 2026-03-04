@@ -96,6 +96,7 @@ def save_checkpoint(
         scheduler (LRScheduler | None, optional): The scheduler to save the state from. Defaults to None.
         preprocessor: The preprocessor/pipeline to save. Defaults to None.
     """
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     pretrained_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
     policy.save_pretrained(pretrained_dir)
     cfg.save_pretrained(pretrained_dir)

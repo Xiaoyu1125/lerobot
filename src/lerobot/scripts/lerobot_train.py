@@ -15,6 +15,7 @@
 # limitations under the License.
 import dataclasses
 import logging
+import random
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -27,7 +28,8 @@ from torch.optim import Optimizer
 
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets.factory import make_dataset
+from lerobot.datasets.factory import make_dataset, resolve_delta_timestamps
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
@@ -146,6 +148,26 @@ def update_policy(
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
+
+
+def compute_validation_loss(
+    policy: PreTrainedPolicy,
+    val_dataloader: torch.utils.data.DataLoader,
+    preprocessor,
+    accelerator: Accelerator,
+) -> float:
+    """Compute mean loss over the full validation dataset."""
+    policy.eval()
+    total_loss = 0.0
+    num_batches = 0
+    with torch.no_grad(), accelerator.autocast():
+        for batch in val_dataloader:
+            batch = preprocessor(batch)
+            loss, _ = policy.forward(batch)
+            total_loss += loss.item()
+            num_batches += 1
+    policy.train()
+    return total_loss / num_batches if num_batches > 0 else float("nan")
 
 
 @parser.wrap()
@@ -336,25 +358,73 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
-        shuffle = False
+    # Split episodes into 95% train / 5% val (non-streaming only)
+    val_dataloader = None
+    if not cfg.dataset.streaming:
+        total_episodes = dataset.meta.total_episodes
+        all_ep_indices = list(range(total_episodes))
+        ep_rng = random.Random(cfg.seed if cfg.seed is not None else 42)
+        ep_rng.shuffle(all_ep_indices)
+        num_val_episodes = max(1, round(0.05 * total_episodes))
+        val_episodes = sorted(all_ep_indices[:num_val_episodes])
+        train_episodes = sorted(all_ep_indices[num_val_episodes:])
+
+        if is_main_process:
+            logging.info(
+                f"Episode split: {len(train_episodes)} train, {len(val_episodes)} val "
+                f"({num_val_episodes / total_episodes * 100:.1f}% val)"
+            )
+            logging.info(f"Val episode indices: {val_episodes}")
+
+        # Training sampler restricted to train episodes
+        drop_n_last_frames = getattr(cfg.policy, "drop_n_last_frames", 0)
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],
             dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=cfg.policy.drop_n_last_frames,
+            episode_indices_to_use=train_episodes,
+            drop_n_last_frames=drop_n_last_frames,
             shuffle=True,
         )
+
+        # Validation dataset: val episodes only, NO image augmentation (mirrors openpi's train=False)
+        delta_timestamps = resolve_delta_timestamps(cfg.policy, dataset.meta)
+        val_dataset = LeRobotDataset(
+            cfg.dataset.repo_id,
+            root=cfg.dataset.root,
+            episodes=val_episodes,
+            delta_timestamps=delta_timestamps,
+            image_transforms=None,
+            revision=cfg.dataset.revision,
+            video_backend=cfg.dataset.video_backend,
+            tolerance_s=cfg.tolerance_s,
+        )
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
+        )
     else:
-        shuffle = True
-        sampler = None
+        # Streaming dataset: no episode split, original sampler logic
+        if hasattr(cfg.policy, "drop_n_last_frames"):
+            sampler = EpisodeAwareSampler(
+                dataset.meta.episodes["dataset_from_index"],
+                dataset.meta.episodes["dataset_to_index"],
+                episode_indices_to_use=dataset.episodes,
+                drop_n_last_frames=cfg.policy.drop_n_last_frames,
+                shuffle=True,
+            )
+        else:
+            sampler = None
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
         batch_size=cfg.batch_size,
-        shuffle=shuffle and not cfg.dataset.streaming,
+        shuffle=(sampler is None) and (not cfg.dataset.streaming),
         sampler=sampler,
         pin_memory=device.type == "cuda",
         drop_last=False,
@@ -380,10 +450,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     # Use effective batch size for proper epoch calculation in distributed training
     effective_batch_size = cfg.batch_size * accelerator.num_processes
+    # Use train-only frame/episode counts for accurate epoch tracking
+    train_num_frames = len(sampler) if sampler is not None else dataset.num_frames
+    train_num_episodes = len(train_episodes) if val_dataloader is not None else dataset.num_episodes
     train_tracker = MetricsTracker(
         effective_batch_size,
-        dataset.num_frames,
-        dataset.num_episodes,
+        train_num_frames,
+        train_num_episodes,
         train_metrics,
         initial_step=step,
         accelerator=accelerator,
@@ -418,6 +491,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        is_val_step = val_dataloader is not None and cfg.val_freq > 0 and step % cfg.val_freq == 0
 
         if is_log_step:
             logging.info(train_tracker)
@@ -505,6 +579,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
+            accelerator.wait_for_everyone()
+
+        if is_val_step:
+            if is_main_process:
+                logging.info(f"Computing validation loss at step {step}")
+                val_loss = compute_validation_loss(
+                    accelerator.unwrap_model(policy),
+                    val_dataloader,
+                    preprocessor,
+                    accelerator,
+                )
+                logging.info(f"step:{step} val/loss:{val_loss:.4f}")
+                if wandb_logger:
+                    wandb_logger.log_dict({"val/loss": val_loss}, step)
             accelerator.wait_for_everyone()
 
     if eval_env:
