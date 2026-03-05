@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 用于循环运行不同 shuffle_buffer_size 参数的训练脚本
-shuffle_buffer_size 从 100 到 2000，间隔 100
+shuffle_buffer_size 从 10 到 200，间隔 10
 """
 
 import subprocess
@@ -17,22 +17,25 @@ def run_training():
         "src/lerobot/scripts/lerobot_train.py",
         "--policy.type=smolvla",
         "--dataset.repo_id=/public/xiaoyu/svla_so100_stacking",
-        "--batch_size=32",
+        "--batch_size=4",
         "--steps=200000",
         "--policy.repo_id=/home/xiaoyu/lerobot/lerobot/outputs",
-        "--wandb.enable=true",
+        "--wandb.enable=false",
         "--wandb.mode=offline",
         "--dataset.streaming=true",
+        "--num_workers=1",
+        "--dataset.root=/public/xiaoyu/svla_so100_stacking",
+        "--dataset.video_backend=pyav",
     ]
 
-    buffer_sizes = range(200, 2100, 100)
+    buffer_sizes = range(10, 210, 10)
     total_runs = len(list(buffer_sizes))
 
     print(f"total {total_runs} training times")
     print(f"outputs root: {OUTPUTS_ROOT}")
     print("-" * 80)
 
-    for idx, buffer_size in enumerate(range(200, 2100, 100), 1):
+    for idx, buffer_size in enumerate(range(20, 210, 10), 1):
         run_id = "streaming"+str(buffer_size)
         output_dir = OUTPUTS_ROOT / run_id
 

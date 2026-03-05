@@ -214,6 +214,7 @@ class ProcessorConfigKwargs(TypedDict, total=False):
 def make_pre_post_processors(
     policy_cfg: PreTrainedConfig,
     pretrained_path: str | None = None,
+    dataset=None,
     **kwargs: Unpack[ProcessorConfigKwargs],
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
@@ -355,6 +356,7 @@ def make_pre_post_processors(
         processors = make_smolvla_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
+            dataset=dataset,
         )
 
     elif isinstance(policy_cfg, SARMConfig):

@@ -78,6 +78,7 @@ class TokenizerProcessorStep(ObservationProcessorStep):
     tokenizer: Any | None = None  # Use `Any` for compatibility without a hard dependency
     max_length: int = 512
     task_key: str = "task"
+    task_strings: list[str] | None = None  # Optional list of task strings for looking up from task_index
     padding_side: str = "right"
     padding: str = "max_length"
     truncation: bool = True
@@ -129,7 +130,30 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         if complementary_data is None:
             raise ValueError("Complementary data is None so no task can be extracted from it")
 
-        task = complementary_data[self.task_key]
+        task = complementary_data.get(self.task_key)
+        
+        # If task is None but we have task_strings and task_index, look up the task
+        if task is None and self.task_strings is not None:
+            task_index = complementary_data.get("task_index")
+            if task_index is not None:
+                # Handle tensor or int
+                if hasattr(task_index, 'item'):
+                    # It's a tensor
+                    if task_index.numel() == 1:
+                        # Single sample
+                        idx = task_index.item()
+                        if 0 <= idx < len(self.task_strings):
+                            return [self.task_strings[idx]]
+                    else:
+                        # Batch of samples - return list of tasks
+                        tasks = []
+                        for idx in task_index.cpu().numpy():
+                            if 0 <= idx < len(self.task_strings):
+                                tasks.append(self.task_strings[idx])
+                        return tasks if tasks else None
+                elif isinstance(task_index, int) and 0 <= task_index < len(self.task_strings):
+                    return [self.task_strings[task_index]]
+        
         if task is None:
             raise ValueError("Task extracted from Complementary data is None")
 

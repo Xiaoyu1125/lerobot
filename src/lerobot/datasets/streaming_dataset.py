@@ -13,6 +13,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
+import time
 from collections.abc import Callable, Generator, Iterator
 from pathlib import Path
 
@@ -35,7 +37,6 @@ from lerobot.datasets.utils import (
 )
 from lerobot.datasets.video_utils import (
     VideoDecoderCache,
-    decode_video_frames_torchcodec,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME, LOOKAHEAD_BACKTRACKTABLE, LOOKBACK_BACKTRACKTABLE
 
@@ -94,6 +95,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         seed: int = 42,
         rng: np.random.Generator | None = None,
         shuffle: bool = True,
+        video_backend: str = "pyav",
     ):
         """Initialize a StreamingLeRobotDataset.
 
@@ -112,6 +114,8 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             seed (int, optional): Reproducibility random seed.
             rng (np.random.Generator | None, optional): Random number generator.
             shuffle (bool, optional): Whether to shuffle the dataset across exhaustions. Defaults to True.
+            video_backend (str, optional): Video backend to use for decoding. Defaults to "pyav".
+                Options: "pyav" (recommended), "torchcodec" (may have issues with AV1 on some platforms).
         """
         super().__init__()
         self.repo_id = repo_id
@@ -128,6 +132,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         self.streaming = streaming
         self.buffer_size = buffer_size
+        self.video_backend = video_backend
 
         # We cache the video decoders to avoid re-initializing them at each frame (avoiding a ~10x slowdown)
         self.video_decoder_cache = None
@@ -157,7 +162,12 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             revision=self.revision,
         )
 
-        self.num_shards = min(self.hf_dataset.num_shards, max_num_shards)
+        # num_shards is only available for IterableDataset (streaming=True)
+        if self.streaming:
+            self.num_shards = min(self.hf_dataset.num_shards, max_num_shards)
+        else:
+            # For non-streaming, use a single shard
+            self.num_shards = 1
 
     @property
     def num_frames(self):
@@ -170,6 +180,44 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     @property
     def fps(self):
         return self.meta.fps
+
+    @staticmethod
+    def collate_fn(batch: list[dict]) -> dict:
+        """Custom collate function to handle 'task' string field that cannot be concatenated.
+
+        This function is needed because accelerate DataLoader cannot concatenate string tensors.
+        The 'task' field is converted to integer tensors (using task_index) for concatenation,
+        and the original string task is stored separately.
+        """
+        import torch
+        import numpy as np
+
+        # Separate 'task' field from the rest
+        task_list = [item.pop("task") for item in batch]
+
+        # Stack tensors for numeric fields
+        collated = {}
+        for key in batch[0].keys():
+            if key == "task":
+                continue
+            values = [item[key] for item in batch]
+            if isinstance(values[0], torch.Tensor):
+                collated[key] = torch.stack(values)
+            else:
+                # Use numpy or default stacking for non-tensor values
+                try:
+                    collated[key] = np.stack(values)
+                    collated[key] = torch.from_numpy(collated[key])
+                except:
+                    # Fallback to list
+                    collated[key] = values
+
+        # Add 'task' as a tensor of task indices for accelerate compatibility
+        # Note: The actual task strings can be retrieved from dataset.meta.tasks using the task_index
+        task_indices = torch.tensor([item.get("task_index", -1) for item in batch], dtype=torch.long)
+        collated["task"] = task_indices
+
+        return collated
 
     @staticmethod
     def _iter_random_indices(
@@ -191,43 +239,61 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         if self.video_decoder_cache is None:
             self.video_decoder_cache = VideoDecoderCache()
 
-        # keep the same seed across exhaustions if shuffle is False, otherwise shuffle data across exhaustions
-        rng = np.random.default_rng(self.seed) if not self.shuffle else self.rng
+        # Infinite iteration for training with accelerator.prepare()
+        while True:
+            iter_start_time = time.time()
+            # keep the same seed across exhaustions if shuffle is False, otherwise shuffle data across exhaustions
+            rng = np.random.default_rng(self.seed) if not self.shuffle else self.rng
 
-        buffer_indices_generator = self._iter_random_indices(rng, self.buffer_size)
+            buffer_indices_generator = self._iter_random_indices(rng, self.buffer_size)
 
-        idx_to_backtrack_dataset = {
-            idx: self._make_backtrackable_dataset(safe_shard(self.hf_dataset, idx, self.num_shards))
-            for idx in range(self.num_shards)
-        }
+            idx_to_backtrack_dataset = {
+                idx: self._make_backtrackable_dataset(safe_shard(self.hf_dataset, idx, self.num_shards))
+                for idx in range(self.num_shards)
+            }
 
-        # This buffer is populated while iterating on the dataset's shards
-        # the logic is to add 2 levels of randomness:
-        # (1) sample one shard at random from the ones available, and
-        # (2) sample one frame from the shard sampled at (1)
-        frames_buffer = []
-        while available_shards := list(idx_to_backtrack_dataset.keys()):
-            shard_key = next(self._infinite_generator_over_elements(rng, available_shards))
-            backtrack_dataset = idx_to_backtrack_dataset[shard_key]  # selects which shard to iterate on
+            logging.info(f"[StreamingDataset] Created backtrackable datasets for {self.num_shards} shards in {time.time() - iter_start_time:.2f}s")
 
-            try:
-                for frame in self.make_frame(backtrack_dataset):
-                    if len(frames_buffer) == self.buffer_size:
-                        i = next(buffer_indices_generator)  # samples a element from the buffer
-                        yield frames_buffer[i]
-                        frames_buffer[i] = frame
-                    else:
-                        frames_buffer.append(frame)
-                    break  # random shard sampled, switch shard
-            except (
-                RuntimeError,
-                StopIteration,
-            ):  # NOTE: StopIteration inside a generator throws a RuntimeError since python 3.7
-                del idx_to_backtrack_dataset[shard_key]  # Remove exhausted shard, onto another shard
+            # This buffer is populated while iterating on the dataset's shards
+            # the logic is to add 2 levels of randomness:
+            # (1) sample one shard at random from the ones available, and
+            # (2) sample one frame from the shard sampled at (1)
+            frames_buffer = []
+            frame_idx = 0
+            buffer_start_time = time.time()
+            logging.info(f"[StreamingDataset] Starting buffer fill, target: {self.buffer_size}")
 
-        # Once shards are all exhausted, shuffle the buffer and yield the remaining frames
-        rng.shuffle(frames_buffer)
-        yield from frames_buffer
+            while available_shards := list(idx_to_backtrack_dataset.keys()):
+                shard_key = next(self._infinite_generator_over_elements(rng, available_shards))
+                backtrack_dataset = idx_to_backtrack_dataset[shard_key]  # selects which shard to iterate on
+                logging.info(f"[StreamingDataset] Sampling shard {shard_key}")
+
+                try:
+                    frame_start = time.time()
+                    for frame in self.make_frame(backtrack_dataset):
+                        frame_time = time.time() - frame_start
+                        logging.info(f"[StreamingDataset] Frame {frame_idx}: took {frame_time:.2f}s, buffer: {len(frames_buffer)}/{self.buffer_size}")
+
+                        if len(frames_buffer) == self.buffer_size:
+                            i = next(buffer_indices_generator)  # samples a element from the buffer
+                            if frame_idx == self.buffer_size:
+                                total_buffer_time = time.time() - buffer_start_time
+                                logging.info(f"[StreamingDataset] Buffer filled! {self.buffer_size} frames in {total_buffer_time:.2f}s (avg {total_buffer_time/self.buffer_size:.2f}s/frame)")
+                            yield frames_buffer[i]
+                            frames_buffer[i] = frame
+                        else:
+                            frames_buffer.append(frame)
+                        frame_idx += 1
+                        break  # random shard sampled, switch shard
+                    logging.info(f"[StreamingDataset] make_frame iterator ended without yielding")
+                except Exception as e:
+                    logging.error(f"[StreamingDataset] Shard {shard_key} error: {type(e).__name__}: {e}")
+                    del idx_to_backtrack_dataset[shard_key]  # Remove exhausted shard, onto another shard
+
+            # Once shards are all exhausted, shuffle the buffer and yield the remaining frames
+            logging.info(f"[StreamingDataset] All shards done. Buffer: {len(frames_buffer)} frames")
+            rng.shuffle(frames_buffer)
+            yield from frames_buffer
 
     def _get_window_steps(
         self, delta_timestamps: dict[str, list[float]] | None = None, dynamic_bounds: bool = False
@@ -300,7 +366,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
     def make_frame(self, dataset_iterator: Backtrackable) -> Generator:
         """Makes a frame starting from a dataset iterator"""
+        logging.info("[make_frame] Starting, calling next(dataset_iterator)...")
         item = next(dataset_iterator)
+        logging.info(f"[make_frame] Got item, episode_index: {item.get('episode_index')}")
         item = item_to_torch(item)
 
         updates = []  # list of "updates" to apply to the item retrieved from hf_dataset (w/o camera features)
@@ -327,13 +395,18 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         # Load video frames, when needed
         if len(self.meta.video_keys) > 0:
+            logging.info(f"[make_frame] Loading {len(self.meta.video_keys)} video frames for episode {ep_idx}...")
             original_timestamps = self._make_timestamps_from_indices(current_ts, self.delta_indices)
 
             # Some timestamps might not result available considering the episode's boundaries
             query_timestamps = self._get_query_timestamps(
                 current_ts, self.delta_indices, episode_boundaries_ts
             )
+
+            video_start = time.time()
             video_frames = self._query_videos(query_timestamps, ep_idx)
+            video_time = time.time() - video_start
+            logging.info(f"[make_frame] Video decoding took {video_time:.2f}s for {len(self.meta.video_keys)} cameras")
 
             if self.image_transforms is not None:
                 image_keys = self.meta.camera_keys
@@ -353,6 +426,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         for update in updates:
             result.update(update)
 
+        # Keep 'task' as string - this will be handled specially in collate
         result["task"] = self.meta.tasks.iloc[item["task_index"]].name
 
         yield result
@@ -384,14 +458,36 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         Segmentation Fault. This probably happens because a memory reference to the video loader is created in
         the main process and a subprocess fails to access it.
         """
+        from lerobot.datasets.video_utils import decode_video_frames
 
         item = {}
         for video_key, query_ts in query_timestamps.items():
-            root = self.meta.url_root if self.streaming and not self.streaming_from_local else self.root
+            # Determine the correct root path:
+            # - If streaming from local (root is provided), use local path
+            # - If streaming from HF Hub, use url_root
+            if self.streaming_from_local:
+                root = self.root
+            elif self.streaming:
+                root = self.meta.url_root
+            else:
+                root = self.root
+
             video_path = f"{root}/{self.meta.get_video_file_path(ep_idx, video_key)}"
-            frames = decode_video_frames_torchcodec(
-                video_path, query_ts, self.tolerance_s, decoder_cache=self.video_decoder_cache
+            logging.info(f"[_query_videos] Decoding {video_key} with {self.video_backend}, timestamps: {query_ts}")
+
+            # Check if file exists
+            from pathlib import Path
+            if not Path(video_path).exists():
+                logging.error(f"[_query_videos] Video file does NOT exist: {video_path}")
+                raise FileNotFoundError(f"Video file not found: {video_path}")
+
+            decode_start = time.time()
+            # Use the specified video backend (pyav or torchcodec)
+            frames = decode_video_frames(
+                video_path, query_ts, self.tolerance_s, backend=self.video_backend
             )
+            decode_time = time.time() - decode_start
+            logging.info(f"[_query_videos] Decoded {video_key} in {decode_time:.2f}s, shape: {frames.shape}")
 
             item[video_key] = frames.squeeze(0) if len(query_ts) == 1 else frames
 

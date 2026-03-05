@@ -39,6 +39,7 @@ from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PR
 def make_smolvla_pre_post_processors(
     config: SmolVLAConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+    dataset=None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
@@ -66,6 +67,12 @@ def make_smolvla_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
+    # Get task strings from dataset if available
+    task_strings = None
+    if dataset is not None and hasattr(dataset, 'meta') and hasattr(dataset.meta, 'tasks'):
+        # tasks is a DataFrame with task_index as index, get the index values as task strings
+        task_strings = list(dataset.meta.tasks.index)
+
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
@@ -75,6 +82,7 @@ def make_smolvla_pre_post_processors(
             padding=config.pad_language_to,
             padding_side="right",
             max_length=config.tokenizer_max_length,
+            task_strings=task_strings,
         ),
         DeviceProcessorStep(device=config.device),
         NormalizerProcessorStep(

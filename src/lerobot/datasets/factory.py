@@ -111,6 +111,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 max_num_shards=cfg.num_workers,
                 tolerance_s=cfg.tolerance_s,
                 buffer_size=cfg.dataset.shuffle_buffer_size,
+                video_backend=cfg.dataset.video_backend,
             )
     else:
         raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")

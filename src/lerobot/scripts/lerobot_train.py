@@ -302,6 +302,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
+        dataset=dataset,
         **processor_kwargs,
         **postprocessor_kwargs,
     )
@@ -420,6 +421,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         else:
             sampler = None
 
+    # Get collate_fn from dataset if available (e.g., StreamingLeRobotDataset for handling string 'task' field)
+    collate_fn = getattr(dataset, "collate_fn", None)
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -429,6 +433,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         pin_memory=device.type == "cuda",
         drop_last=False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
+        collate_fn=collate_fn,
     )
 
     # Prepare everything with accelerator
