@@ -19,7 +19,7 @@ def run_training():
     base_cmd = [
         "python",
         "src/lerobot/scripts/lerobot_train.py",
-        "--policy.path=/data/lerobot/smolvla_base",
+        "--policy.type=smolvla",
         "--dataset.repo_id=/data/lerobot/svla_so100_stacking",
         # "--dataset.repo_id=/public/xiaoyu/svla_so100_stacking",
         "--batch_size=32",
