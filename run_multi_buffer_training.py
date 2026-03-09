@@ -28,7 +28,7 @@ def run_training():
         # "--policy.repo_id=/home/xiaoyu/lerobot/lerobot/outputs",
         "--policy.repo_id=/data/lerobot/svla_so100_stacking/outputs",
         "--wandb.enable=true",
-        "--wandb.mode=online",
+        "--wandb.mode=offline",
         "--dataset.streaming=true",
         "--num_workers=1",
         "--dataset.root=/data/svla_so100_stacking",
