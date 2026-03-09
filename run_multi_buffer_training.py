@@ -27,7 +27,7 @@ def run_training():
         "--steps=200000",
         "--policy.repo_id=/home/xiaoyu/lerobot/lerobot/outputs",
         "--wandb.enable=true",
-        "--wandb.mode=online",
+        "--wandb.mode=offline",
         "--dataset.streaming=true",
         "--num_workers=1",
         "--dataset.root=/data/svla_so100_stacking",
