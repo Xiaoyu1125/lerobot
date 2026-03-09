@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 # OUTPUTS_ROOT = Path.home() / "lerobot" / "outputs"
-OUTPUTS_ROOT = Path("/data") / "lerobot" / "svla_so100_stacking" / "outputs"
+OUTPUTS_ROOT = Path("/data") / "lerobot"  / "outputs"
 
 def run_training():
 
@@ -26,7 +26,7 @@ def run_training():
         "--batch_size=32",
         "--steps=200000",
         # "--policy.repo_id=/home/xiaoyu/lerobot/lerobot/outputs",
-        "--policy.repo_id=/data/lerobot/svla_so100_stacking/outputs",
+        "--policy.repo_id=/data/svla_so100_stacking/outputs",
         "--wandb.enable=true",
         "--wandb.mode=offline",
         "--dataset.streaming=true",
