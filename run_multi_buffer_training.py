@@ -8,8 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-# OUTPUTS_ROOT = Path.home() / "lerobot" / "outputs"
-OUTPUTS_ROOT = Path("/data") / "lerobot"  / "outputs"
+OUTPUTS_ROOT = Path.home() / "lerobot" / "outputs"
 
 def run_training():
 
@@ -25,10 +24,9 @@ def run_training():
         # "--dataset.repo_id=/public/xiaoyu/svla_so100_stacking",
         "--batch_size=32",
         "--steps=200000",
-        # "--policy.repo_id=/home/xiaoyu/lerobot/lerobot/outputs",
-        "--policy.repo_id=/data/svla_so100_stacking/outputs",
+        "--policy.repo_id=/home/xiaoyu/lerobot/lerobot/outputs",
         "--wandb.enable=true",
-        "--wandb.mode=offline",
+        "--wandb.mode=online",
         "--dataset.streaming=true",
         "--num_workers=1",
         "--dataset.root=/data/svla_so100_stacking",
