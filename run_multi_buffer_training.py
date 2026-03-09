@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 用于循环运行不同 shuffle_buffer_size 参数的训练脚本
-shuffle_buffer_size 从 10 到 200，间隔 10
+shuffle_buffer_size 从 100 到 2000，间隔 100
 """
 
 import subprocess
@@ -12,31 +12,38 @@ OUTPUTS_ROOT = Path.home() / "lerobot" / "outputs"
 
 def run_training():
 
+    # 指定验证集 episodes (从数据集中选取几个 episode 作为验证集)
+    # 例如: val_episodes = [0, 1, 2]  # 使用前3个 episode 作为验证
+    val_episodes = [0, 1, 2]
+
     base_cmd = [
         "python",
         "src/lerobot/scripts/lerobot_train.py",
         "--policy.type=smolvla",
-        "--dataset.repo_id=/public/xiaoyu/svla_so100_stacking",
-        "--batch_size=4",
+        "--dataset.repo_id=/data/svla_so100_stacking",
+        # "--dataset.repo_id=/public/xiaoyu/svla_so100_stacking",
+        "--batch_size=32",
         "--steps=200000",
         "--policy.repo_id=/home/xiaoyu/lerobot/lerobot/outputs",
-        "--wandb.enable=false",
-        "--wandb.mode=offline",
+        "--wandb.enable=true",
+        "--wandb.mode=online",
         "--dataset.streaming=true",
         "--num_workers=1",
-        "--dataset.root=/public/xiaoyu/svla_so100_stacking",
+        "--dataset.root=/data/svla_so100_stacking",
+        # "--dataset.root=/public/xiaoyu/svla_so100_stacking",
         "--dataset.video_backend=pyav",
+        "--dataset.val_episodes=" + str(val_episodes),
     ]
 
-    buffer_sizes = range(10, 210, 10)
+    buffer_sizes = range(100, 2100, 100)
     total_runs = len(list(buffer_sizes))
 
     print(f"total {total_runs} training times")
     print(f"outputs root: {OUTPUTS_ROOT}")
     print("-" * 80)
 
-    for idx, buffer_size in enumerate(range(20, 210, 10), 1):
-        run_id = "streaming"+str(buffer_size)
+    for idx, buffer_size in enumerate(buffer_sizes, 1):
+        run_id = "shuffle"+str(buffer_size)
         output_dir = OUTPUTS_ROOT / run_id
 
         cmd = base_cmd + [

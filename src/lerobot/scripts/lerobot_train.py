@@ -18,6 +18,7 @@ import logging
 import random
 import time
 from contextlib import nullcontext
+from copy import deepcopy
 from pprint import pformat
 from typing import Any
 
@@ -360,7 +361,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # Split episodes into 95% train / 5% val (non-streaming only)
+    # Or use val_episodes from config when streaming with explicit validation set
     val_dataloader = None
+    train_episodes = None
     if not cfg.dataset.streaming:
         total_episodes = dataset.meta.total_episodes
         all_ep_indices = list(range(total_episodes))
@@ -408,9 +411,64 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             drop_last=False,
             prefetch_factor=2 if cfg.num_workers > 0 else None,
         )
+    elif cfg.dataset.val_episodes is not None:
+        # Streaming mode with explicit val_episodes from config
+        val_episodes = cfg.dataset.val_episodes
+        # Handle case when dataset.episodes is None (streaming datasets without explicit episodes)
+        all_episodes = dataset.episodes if dataset.episodes is not None else list(range(dataset.meta.total_episodes))
+        train_episodes = [ep for ep in all_episodes if ep not in val_episodes]
+        if is_main_process:
+            logging.info(f"Using val_episodes from config: {val_episodes}")
+            logging.info(f"Episode split: {len(train_episodes)} train, {len(val_episodes)} val")
+
+        # Training sampler restricted to train episodes
+        # Note: samplers are not compatible with IterableDataset (streaming mode)
+        drop_n_last_frames = getattr(cfg.policy, "drop_n_last_frames", 0)
+        if not cfg.dataset.streaming:
+            sampler = EpisodeAwareSampler(
+                dataset.meta.episodes["dataset_from_index"],
+                dataset.meta.episodes["dataset_to_index"],
+                episode_indices_to_use=train_episodes,
+                drop_n_last_frames=drop_n_last_frames,
+                shuffle=True,
+            )
+        else:
+            # For streaming datasets, recreate the dataset with only train episodes
+            # since we can't use samplers with IterableDataset
+            sampler = None
+            if is_main_process:
+                logging.info(f"Recreating streaming dataset with train episodes only: {train_episodes}")
+
+            # Create a modified config for training dataset
+            train_cfg = deepcopy(cfg)
+            train_cfg.dataset.episodes = train_episodes
+            dataset = make_dataset(train_cfg)
+
+        # Validation dataset: val episodes only, NO image augmentation
+        delta_timestamps = resolve_delta_timestamps(cfg.policy, dataset.meta)
+        val_dataset = LeRobotDataset(
+            cfg.dataset.repo_id,
+            root=cfg.dataset.root,
+            episodes=val_episodes,
+            delta_timestamps=delta_timestamps,
+            image_transforms=None,
+            revision=cfg.dataset.revision,
+            video_backend=cfg.dataset.video_backend,
+            tolerance_s=cfg.tolerance_s,
+        )
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
+        )
     else:
         # Streaming dataset: no episode split, original sampler logic
-        if hasattr(cfg.policy, "drop_n_last_frames"):
+        # Note: samplers are not compatible with IterableDataset (streaming mode)
+        if hasattr(cfg.policy, "drop_n_last_frames") and not cfg.dataset.streaming:
             sampler = EpisodeAwareSampler(
                 dataset.meta.episodes["dataset_from_index"],
                 dataset.meta.episodes["dataset_to_index"],
