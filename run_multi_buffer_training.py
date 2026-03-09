@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 # OUTPUTS_ROOT = Path.home() / "lerobot" / "outputs"
-OUTPUTS_ROOT =   "/data" / "lerobot" / "svla_so100_stacking" / "outputs"
+OUTPUTS_ROOT = Path("/data") / "lerobot" / "svla_so100_stacking" / "outputs"
 
 def run_training():
 
