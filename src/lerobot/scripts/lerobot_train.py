@@ -438,6 +438,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             sampler = None
             if is_main_process:
                 logging.info(f"Recreating streaming dataset with train episodes only: {train_episodes}")
+                logging.info("Releasing old dataset to avoid resource contention...")
+
+            # Release old dataset to prevent resource contention and performance degradation
+            del dataset
+            import gc
+            gc.collect()
+
+            if is_main_process:
+                logging.info("Old dataset released, creating filtered dataset.")
 
             # Create a modified config for training dataset
             train_cfg = deepcopy(cfg)
