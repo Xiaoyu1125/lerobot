@@ -34,6 +34,43 @@ TRAIN_CONFIG_NAME = "train_config.json"
 
 
 @dataclass
+class ProfilerConfig:
+    """Configuration for torch.profiler profiling of the DataLoader pipeline.
+
+    Profiling identifies bottlenecks in:
+    - disk_read: Reading parquet/video files from disk
+    - video_decode: Decoding frames with pyav/torchcodec
+    - image_transforms: Data augmentation (resize, crop, normalize)
+    - dataloader_total: Full batch retrieval from the dataloader
+
+    Usage:
+        python lerobot_train.py ... --profiler.enabled True --profiler.trace_dir ./profiler_traces
+        tensorboard --logdir ./profiler_traces  # then navigate to PLUGIN > pytorch_profiler
+    """
+
+    enabled: bool = False
+    # Directory where .trace.json files are written (tensorboard profiler reads these)
+    trace_dir: Path = Path("./profiler_traces")
+    # Number of warmup steps before recording begins
+    warmup_steps: int = 3
+    # Number of steps to record
+    active_steps: int = 5
+    # Number of steps to skip between recordings (if you want sparse sampling)
+    skip_steps: int = 0
+    # PyTorch scheduler arguments — these control how many iterations are scheduled
+    # ahead. Setting it to 0 disables schedule-based profiling.
+    # When enabled, torch.profiler schedules: warmup + active iterations
+    schedule_wait: int = 0
+    # Extra profiler options as a dict — passed as kwargs to torch.profiler.profile()
+    # e.g. {"profile_memory": True, "with_stack": True, "record_shapes": True}
+    extra_options: dict[str, Any] = field(default_factory=lambda: {
+        "record_shapes": True,
+        "profile_memory": True,
+        "with_stack": True,
+    })
+
+
+@dataclass
 class TrainPipelineConfig(HubMixin):
     dataset: DatasetConfig
     env: envs.EnvConfig | None = None
@@ -52,12 +89,14 @@ class TrainPipelineConfig(HubMixin):
     seed: int | None = 1000
     # Number of workers for the dataloader.
     num_workers: int = 4
+    # Number of workers for validation dataloader. Defaults to num_workers if not set.
+    val_num_workers: int | None = None
     batch_size: int = 8
     steps: int = 100_000
     eval_freq: int = 20_000
     log_freq: int = 200
     val_freq: int = 5_000
-    tolerance_s: float = 1e-4
+    tolerance_s: float = 0.15  # 增加容差以适应视频中的时间戳间隙（0.1秒）
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
@@ -78,6 +117,11 @@ class TrainPipelineConfig(HubMixin):
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
     checkpoint_path: Path | None = field(init=False, default=None)
+
+    # DataLoader profiling (torch.profiler + TensorBoard)
+    # Usage: python lerobot_train.py ... --profiler.enabled True --profiler.trace_dir ./profiler_traces
+    # Then view with: tensorboard --logdir ./profiler_traces
+    profiler: "ProfilerConfig | None" = None
 
     def validate(self) -> None:
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.

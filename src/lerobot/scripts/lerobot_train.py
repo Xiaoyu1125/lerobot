@@ -22,6 +22,9 @@ from copy import deepcopy
 from pprint import pformat
 from typing import Any
 
+import psutil
+from torch.utils.tensorboard import SummaryWriter
+
 import torch
 from accelerate import Accelerator
 from termcolor import colored
@@ -90,7 +93,6 @@ def update_policy(
         - The updated MetricsTracker with new statistics for this step.
         - A dictionary of outputs from the policy's forward pass, for logging purposes.
     """
-    start_time = time.perf_counter()
     policy.train()
 
     # Get RA-BC weights if enabled
@@ -147,7 +149,6 @@ def update_policy(
     train_metrics.loss = loss.item()
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
-    train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
 
 
@@ -156,19 +157,62 @@ def compute_validation_loss(
     val_dataloader: torch.utils.data.DataLoader,
     preprocessor,
     accelerator: Accelerator,
+    use_cache: bool = True,
 ) -> float:
-    """Compute mean loss over the full validation dataset."""
+    """Compute mean loss over the full validation dataset.
+
+    Args:
+        policy: The policy model to evaluate.
+        val_dataloader: DataLoader for validation data.
+        preprocessor: Preprocessor to transform batch data.
+        accelerator: Accelerator instance for distributed training.
+        use_cache: If True, cache preprocessed batches to avoid redundant computation.
+
+    Returns:
+        Mean validation loss.
+    """
     policy.eval()
     total_loss = 0.0
     num_batches = 0
+
+    # Cache preprocessed batches to avoid redundant preprocessing on repeated calls
+    if use_cache and not hasattr(compute_validation_loss, "_val_cache"):
+        compute_validation_loss._val_cache = []
+        compute_validation_loss._cache_complete = False
+        logging.info("Caching validation batches...")
+
     with torch.no_grad(), accelerator.autocast():
-        for batch in val_dataloader:
-            batch = preprocessor(batch)
-            loss, _ = policy.forward(batch)
-            total_loss += loss.item()
-            num_batches += 1
+        if use_cache and hasattr(compute_validation_loss, "_val_cache"):
+            if not compute_validation_loss._cache_complete:
+                # Build cache on first call
+                for batch in val_dataloader:
+                    batch = preprocessor(batch)
+                    compute_validation_loss._val_cache.append(batch)
+                compute_validation_loss._cache_complete = True
+                logging.info(f"Validation cache built: {len(compute_validation_loss._val_cache)} batches")
+
+            # Use cached batches on subsequent calls
+            for batch in compute_validation_loss._val_cache:
+                loss, _ = policy.forward(batch)
+                total_loss += loss.item()
+                num_batches += 1
+        else:
+            # Fallback: process directly without caching
+            for batch in val_dataloader:
+                batch = preprocessor(batch)
+                loss, _ = policy.forward(batch)
+                total_loss += loss.item()
+                num_batches += 1
+
     policy.train()
     return total_loss / num_batches if num_batches > 0 else float("nan")
+
+
+def clear_validation_cache():
+    """Clear the cached validation batches to free memory."""
+    if hasattr(compute_validation_loss, "_val_cache"):
+        compute_validation_loss._val_cache = []
+        compute_validation_loss._cache_complete = False
 
 
 @parser.wrap()
@@ -232,6 +276,29 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     device = accelerator.device
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
+
+    # ── torch.profiler + TensorBoard profiler ──────────────────────────────────
+    profiler = None
+    tb_writer = None
+    if cfg.profiler and cfg.profiler.enabled and is_main_process:
+        tb_writer = SummaryWriter(log_dir=str(cfg.profiler.trace_dir))
+        # Flatten schedule: warmup + active, with optional gap between profiling cycles
+        wait = cfg.profiler.skip_steps
+        warmup = cfg.profiler.warmup_steps
+        active = cfg.profiler.active_steps
+        schedule = torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1)
+        profiler = torch.profiler.profile(
+            schedule=schedule,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(cfg.profiler.trace_dir)),
+            record_shapes=cfg.profiler.extra_options.get("record_shapes", True),
+            profile_memory=cfg.profiler.extra_options.get("profile_memory", True),
+            with_stack=cfg.profiler.extra_options.get("with_stack", True),
+        )
+        profiler.start()
+        logging.info(
+            f"[Profiler] enabled — trace_dir={cfg.profiler.trace_dir}, "
+            f"warmup={warmup}, active={active}, skip={wait}"
+        )
 
     # Dataset loading synchronization: main process downloads first to avoid race conditions
     if is_main_process:
@@ -402,23 +469,35 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             video_backend=cfg.dataset.video_backend,
             tolerance_s=cfg.tolerance_s,
         )
+        # Use more workers for validation dataloader if configured, otherwise use same as training
+        val_num_workers = getattr(cfg, "val_num_workers", None) or cfg.num_workers
         val_dataloader = torch.utils.data.DataLoader(
             val_dataset,
-            num_workers=cfg.num_workers,
+            num_workers=val_num_workers,
             batch_size=cfg.batch_size,
             shuffle=False,
             pin_memory=device.type == "cuda",
             drop_last=False,
-            prefetch_factor=2 if cfg.num_workers > 0 else None,
+            prefetch_factor=4 if val_num_workers > 0 else None,
+            persistent_workers=val_num_workers > 0,
         )
-    elif cfg.dataset.val_episodes is not None:
-        # Streaming mode with explicit val_episodes from config
-        val_episodes = cfg.dataset.val_episodes
+    elif cfg.dataset.val_episodes is not None or cfg.dataset.num_val_episodes is not None:
+        # Streaming mode with explicit val_episodes or num_val_episodes from config
+        if cfg.dataset.val_episodes is not None:
+            # Use explicit val_episodes list
+            val_episodes = cfg.dataset.val_episodes
+        else:
+            # Use num_val_episodes to select first n episodes as validation
+            all_ep_indices = list(range(dataset.meta.total_episodes))
+            num_val = cfg.dataset.num_val_episodes
+            val_episodes = sorted(all_ep_indices[:num_val])
+            if is_main_process:
+                logging.info(f"Using first {num_val} episodes as validation set: {val_episodes}")
+
         # Handle case when dataset.episodes is None (streaming datasets without explicit episodes)
         all_episodes = dataset.episodes if dataset.episodes is not None else list(range(dataset.meta.total_episodes))
         train_episodes = [ep for ep in all_episodes if ep not in val_episodes]
         if is_main_process:
-            logging.info(f"Using val_episodes from config: {val_episodes}")
             logging.info(f"Episode split: {len(train_episodes)} train, {len(val_episodes)} val")
 
         # Training sampler restricted to train episodes
@@ -465,14 +544,17 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             video_backend=cfg.dataset.video_backend,
             tolerance_s=cfg.tolerance_s,
         )
+        # Use more workers for validation dataloader if configured, otherwise use same as training
+        val_num_workers = getattr(cfg, "val_num_workers", None) or cfg.num_workers
         val_dataloader = torch.utils.data.DataLoader(
             val_dataset,
-            num_workers=cfg.num_workers,
+            num_workers=val_num_workers,
             batch_size=cfg.batch_size,
             shuffle=False,
             pin_memory=device.type == "cuda",
             drop_last=False,
-            prefetch_factor=2 if cfg.num_workers > 0 else None,
+            prefetch_factor=4 if val_num_workers > 0 else None,
+            persistent_workers=val_num_workers > 0,
         )
     else:
         # Streaming dataset: no episode split, original sampler logic
@@ -516,8 +598,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         "loss": AverageMeter("loss", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
-        "update_s": AverageMeter("updt_s", ":.3f"),
-        "dataloading_s": AverageMeter("data_s", ":.3f"),
     }
 
     # Use effective batch size for proper epoch calculation in distributed training
@@ -540,10 +620,43 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         )
 
     for _ in range(step, cfg.steps):
-        start_time = time.perf_counter()
-        batch = next(dl_iter)
-        batch = preprocessor(batch)
-        train_tracker.dataloading_s = time.perf_counter() - start_time
+        if profiler is not None:
+            profiler.step()
+        with torch.profiler.record_function("dataloader_batch_fetch"):
+            batch = next(dl_iter)
+        with torch.profiler.record_function("dataloader_preprocessor"):
+            batch = preprocessor(batch)
+
+        # Log GPU memory stats via TensorBoard + console
+        if profiler is not None and tb_writer is not None and device.type == "cuda":
+            allocated = torch.cuda.memory_allocated(device) / 1024**3  # GB
+            reserved = torch.cuda.memory_reserved(device) / 1024**3    # GB
+            tb_writer.add_scalar("gpu_mem/allocated_gb", allocated, step)
+            tb_writer.add_scalar("gpu_mem/reserved_gb", reserved, step)
+        elif profiler is not None and is_main_process and device.type != "cuda":
+            logging.debug("[Profiler] CUDA not available — GPU memory tracking skipped")
+
+        # Log CPU stats via TensorBoard
+        if profiler is not None and tb_writer is not None:
+            # CPU usage percent
+            cpu_percent = psutil.cpu_percent(interval=None)
+            tb_writer.add_scalar("cpu/cpu_usage_percent", cpu_percent, step)
+
+            # CPU memory usage
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            cpu_memory_gb = memory_info.rss / 1024**3  # Resident Set Size in GB
+            tb_writer.add_scalar("cpu/memory_gb", cpu_memory_gb, step)
+
+            # System-wide memory info
+            system_memory = psutil.virtual_memory()
+            tb_writer.add_scalar("cpu/system_memory_used_percent", system_memory.percent, step)
+            tb_writer.add_scalar("cpu/system_memory_available_gb", system_memory.available / 1024**3, step)
+
+            # CPU per-core usage (optional - more verbose)
+            cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
+            for i, core_usage in enumerate(cpu_per_core):
+                tb_writer.add_scalar(f"cpu/core_{i}_usage_percent", core_usage, step)
 
         train_tracker, output_dict = update_policy(
             train_tracker,
@@ -685,6 +798,48 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Properly clean up the distributed process group
     accelerator.wait_for_everyone()
     accelerator.end_training()
+
+    if profiler is not None:
+        profiler.stop()
+        if tb_writer is not None:
+            tb_writer.close()
+        if is_main_process:
+            logging.info(f"[Profiler] stopped — traces saved to {cfg.profiler.trace_dir}")
+            logging.info("Run: tensorboard --logdir ./profiler_traces  # then open PLUGIN > pytorch_profiler")
+
+            # ── Top memory consumers ───────────────────────────────────────────
+            try:
+                import pandas as pd
+                ka = profiler.key_averages()
+                # Try CUDA memory sort first (GPU training), fall back to CPU
+                for sort_col in ("cuda_memory_usage", "CPU Mem", "cpu_memory_usage"):
+                    try:
+                        df = ka.table(sort_by=sort_col, row_limit=20)
+                        break
+                    except (KeyError, TypeError):
+                        continue
+                else:
+                    df = ka.table(row_limit=20)
+
+                if df is not None and len(df) > 0:
+                    sep = "=" * 80
+                    logging.info("\n%s", sep)
+                    logging.info("[Profiler] Top 20 memory consumers (sorted by self + children):")
+                    logging.info("%s", sep)
+                    pd.set_option("display.max_colwidth", 60)
+                    pd.set_option("display.width", 220)
+                    for line in df.to_string(index=False, max_rows=20).split("\n"):
+                        logging.info("  %s", line)
+                    logging.info("%s", sep)
+                    logging.info(
+                        "Tip: In TensorBoard use PLUGIN > pytorch_profiler > Memory View "
+                        "to see per-step allocation/free and torch.cuda peak."
+                    )
+            except Exception as e:
+                logging.warning(f"[Profiler] Could not print memory table: {e}")
+                logging.info(
+                    "View memory trace in TensorBoard: PLUGIN > pytorch_profiler > Memory View"
+                )
 
 
 def main():

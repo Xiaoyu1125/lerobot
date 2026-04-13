@@ -13,8 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import logging
-import time
 from collections.abc import Callable, Generator, Iterator
 from pathlib import Path
 
@@ -162,12 +160,23 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             revision=self.revision,
         )
 
+        import logging
+        logging.info(f"Streaming dataset loaded: streaming={self.streaming}, streaming_from_local={self.streaming_from_local}")
+        logging.info(f"Dataset root: {self.root}")
+
         # num_shards is only available for IterableDataset (streaming=True)
         if self.streaming:
             self.num_shards = min(self.hf_dataset.num_shards, max_num_shards)
+            logging.info(f"Dataset num_shards: {self.hf_dataset.num_shards}, using max_num_shards: {max_num_shards}")
+            # Ensure at least 1 shard so the iterator loop can run (num_workers=0 => max_num_shards=0)
+            if self.num_shards == 0:
+                self.num_shards = 1
+                logging.warning(f"num_shards is 0, setting to 1")
         else:
             # For non-streaming, use a single shard
             self.num_shards = 1
+
+        logging.info(f"Final num_shards for iteration: {self.num_shards}")
 
     @property
     def num_frames(self):
@@ -241,7 +250,6 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         # Infinite iteration for training with accelerator.prepare()
         while True:
-            iter_start_time = time.time()
             # keep the same seed across exhaustions if shuffle is False, otherwise shuffle data across exhaustions
             rng = np.random.default_rng(self.seed) if not self.shuffle else self.rng
 
@@ -259,32 +267,40 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             # (2) sample one frame from the shard sampled at (1)
             frames_buffer = []
             frame_idx = 0
-            buffer_start_time = time.time()
 
             while available_shards := list(idx_to_backtrack_dataset.keys()):
                 shard_key = next(self._infinite_generator_over_elements(rng, available_shards))
                 backtrack_dataset = idx_to_backtrack_dataset[shard_key]  # selects which shard to iterate on
 
                 try:
-                    frame_start = time.time()
                     for frame in self.make_frame(backtrack_dataset):
-                        frame_time = time.time() - frame_start
-
                         if len(frames_buffer) == self.buffer_size:
                             i = next(buffer_indices_generator)  # samples a element from the buffer
-                            if frame_idx == self.buffer_size:
-                                total_buffer_time = time.time() - buffer_start_time
                             yield frames_buffer[i]
                             frames_buffer[i] = frame
                         else:
                             frames_buffer.append(frame)
                         frame_idx += 1
                         break  # random shard sampled, switch shard
-                except Exception as e:
-                    del idx_to_backtrack_dataset[shard_key]  # Remove exhausted shard, onto another shard
+                except StopIteration:
+                    # Shard is exhausted, remove it and continue with next shard
+                    del idx_to_backtrack_dataset[shard_key]
+                except (FileNotFoundError, Exception) as e:
+                    # Log the error for debugging but remove the shard to continue
+                    import logging
+                    logging.error(f"Error loading from shard {shard_key}: {type(e).__name__}: {e}")
+                    del idx_to_backtrack_dataset[shard_key]  # Remove problematic shard, onto another shard
 
             # Once shards are all exhausted, shuffle the buffer and yield the remaining frames
             rng.shuffle(frames_buffer)
+
+            # If no frames were collected, this indicates a problem with the dataset
+            if len(frames_buffer) == 0:
+                import logging
+                logging.error(f"No frames collected from any shard! This indicates a problem with the dataset loading.")
+                logging.error(f"Available shards: {list(idx_to_backtrack_dataset.keys())}")
+                raise RuntimeError("Failed to load any frames from the streaming dataset. Check logs for details.")
+
             yield from frames_buffer
 
     def _get_window_steps(
@@ -358,8 +374,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
     def make_frame(self, dataset_iterator: Backtrackable) -> Generator:
         """Makes a frame starting from a dataset iterator"""
-        item = next(dataset_iterator)
-        item = item_to_torch(item)
+        with torch.profiler.record_function("dataloader_parquet_read"):
+            item = next(dataset_iterator)
+            item = item_to_torch(item)
 
         updates = []  # list of "updates" to apply to the item retrieved from hf_dataset (w/o camera features)
 
@@ -392,14 +409,13 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 current_ts, self.delta_indices, episode_boundaries_ts
             )
 
-            video_start = time.time()
             video_frames = self._query_videos(query_timestamps, ep_idx)
-            video_time = time.time() - video_start
 
             if self.image_transforms is not None:
-                image_keys = self.meta.camera_keys
-                for cam in image_keys:
-                    video_frames[cam] = self.image_transforms(video_frames[cam])
+                with torch.profiler.record_function("dataloader_image_transforms"):
+                    image_keys = self.meta.camera_keys
+                    for cam in image_keys:
+                        video_frames[cam] = self.image_transforms(video_frames[cam])
 
             updates.append(video_frames)
 
@@ -465,14 +481,21 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             # Check if file exists
             from pathlib import Path
             if not Path(video_path).exists():
-                raise FileNotFoundError(f"Video file not found: {video_path}")
+                error_msg = f"Video file not found: {video_path}"
+                import logging
+                logging.error(f"{error_msg} (episode_index={ep_idx}, video_key={video_key})")
+                raise FileNotFoundError(error_msg)
 
-            decode_start = time.time()
             # Use the specified video backend (pyav or torchcodec)
-            frames = decode_video_frames(
-                video_path, query_ts, self.tolerance_s, backend=self.video_backend
-            )
-            decode_time = time.time() - decode_start
+            try:
+                with torch.profiler.record_function("dataloader_video_decode"):
+                    frames = decode_video_frames(
+                        video_path, query_ts, self.tolerance_s, backend=self.video_backend
+                    )
+            except Exception as e:
+                import logging
+                logging.error(f"Failed to decode video {video_path}: {type(e).__name__}: {e}")
+                raise
 
             item[video_key] = frames.squeeze(0) if len(query_ts) == 1 else frames
 

@@ -31,6 +31,10 @@ class DatasetConfig:
     root: str | None = None
     episodes: list[int] | None = None
     val_episodes: list[int] | None = None
+    # Number of episodes to use for validation. If set, the first `num_val_episodes` episodes
+    # will be used as validation set, and the remaining episodes will be used for training.
+    # This is an alternative to explicitly specifying `val_episodes` as a list.
+    num_val_episodes: int | None = None
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
     revision: str | None = None
     use_imagenet_stats: bool = True
