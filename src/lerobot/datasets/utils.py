@@ -1187,6 +1187,7 @@ def to_parquet_with_hf_images(
     ds = datasets.Dataset.from_dict(df.to_dict(orient="list"), features=features)
     ds.to_parquet(path)
 
+_to_tensor = transforms.ToTensor()
 
 def item_to_torch(item: dict) -> dict:
     """Convert all items in a dictionary to PyTorch tensors where appropriate.
@@ -1199,12 +1200,46 @@ def item_to_torch(item: dict) -> dict:
     Returns:
         dict: Dictionary with all tensor-like items converted to torch.Tensor.
     """
-    for key, val in item.items():
-        if isinstance(val, (np.ndarray | list)) and key not in ["task"]:
-            # Convert numpy arrays and lists to torch tensors
-            item[key] = torch.tensor(val)
-    return item
+    """Recursively convert PIL / numpy / list values to torch tensors where appropriate."""
+    if isinstance(item, PILImage.Image):
+        return _to_tensor(item.convert("RGB"))
 
+    if isinstance(item, np.ndarray):
+        return torch.from_numpy(item)
+
+    if isinstance(item, dict):
+        return {
+            k: item_to_torch(v) if k not in ["task"] else v
+            for k, v in item.items()
+        }
+
+    if isinstance(item, list):
+        # 先递归处理
+        converted = [item_to_torch(v) for v in item]
+
+        # 如果已经是 tensor 列表，尽量 stack
+        if len(converted) > 0 and all(isinstance(v, torch.Tensor) for v in converted):
+            try:
+                return torch.stack(converted)
+            except Exception:
+                return converted
+
+        # 普通数值列表再转 tensor
+        if len(converted) > 0 and all(isinstance(v, (int, float, bool)) for v in converted):
+            return torch.tensor(converted)
+
+        return converted
+
+    if isinstance(item, tuple):
+        converted = tuple(item_to_torch(v) for v in item)
+        if len(converted) > 0 and all(isinstance(v, torch.Tensor) for v in converted):
+            try:
+                return torch.stack(list(converted))
+            except Exception:
+                return converted
+        return converted
+
+    return item
 
 def is_float_in_list(target, float_list, threshold=1e-6):
     return any(abs(target - x) <= threshold for x in float_list)

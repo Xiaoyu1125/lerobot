@@ -96,7 +96,7 @@ class TrainPipelineConfig(HubMixin):
     eval_freq: int = 20_000
     log_freq: int = 200
     val_freq: int = 5_000
-    tolerance_s: float = 0.15  # 增加容差以适应视频中的时间戳间隙（0.1秒）
+    tolerance_s: float = 1e-4
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000

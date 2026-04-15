@@ -622,8 +622,22 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     for _ in range(step, cfg.steps):
         if profiler is not None:
             profiler.step()
+
         with torch.profiler.record_function("dataloader_batch_fetch"):
             batch = next(dl_iter)
+
+        # StreamingLeRobotDataset collate_fn should keep task_index tensor-friendly for accelerate,
+        # so reconstruct raw task strings here right before preprocessing.
+        if cfg.dataset.streaming and "task_index" in batch:
+            task_indices = batch["task_index"]
+
+            if isinstance(task_indices, torch.Tensor):
+                task_indices = task_indices.detach().cpu().view(-1).tolist()
+            elif not isinstance(task_indices, list):
+                task_indices = [task_indices]
+
+            batch["task"] = [dataset.meta.tasks.iloc[int(i)].name for i in task_indices]
+
         with torch.profiler.record_function("dataloader_preprocessor"):
             batch = preprocessor(batch)
 

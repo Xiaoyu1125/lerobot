@@ -192,42 +192,29 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
     @staticmethod
     def collate_fn(batch: list[dict]) -> dict:
-        """Custom collate function to handle 'task' string field that cannot be concatenated.
-
-        This function is needed because accelerate DataLoader cannot concatenate string tensors.
-        The 'task' field is converted to integer tensors (using task_index) for concatenation,
-        and the original string task is stored separately.
-        """
         import torch
         import numpy as np
 
-        # Separate 'task' field from the rest
-        task_list = [item.pop("task") for item in batch]
-
-        # Stack tensors for numeric fields
         collated = {}
+
         for key in batch[0].keys():
+            # Do not pass raw task strings through accelerate
             if key == "task":
                 continue
+
             values = [item[key] for item in batch]
+
             if isinstance(values[0], torch.Tensor):
                 collated[key] = torch.stack(values)
             else:
-                # Use numpy or default stacking for non-tensor values
                 try:
-                    collated[key] = np.stack(values)
-                    collated[key] = torch.from_numpy(collated[key])
-                except:
-                    # Fallback to list
+                    arr = np.stack(values)
+                    collated[key] = torch.from_numpy(arr)
+                except Exception:
                     collated[key] = values
 
-        # Add 'task' as a tensor of task indices for accelerate compatibility
-        # Note: The actual task strings can be retrieved from dataset.meta.tasks using the task_index
-        task_indices = torch.tensor([item.get("task_index", -1) for item in batch], dtype=torch.long)
-        collated["task"] = task_indices
-
-        return collated
-
+        return collated    
+    
     @staticmethod
     def _iter_random_indices(
         rng: np.random.Generator, buffer_size: int, random_batch_size=100
@@ -431,7 +418,14 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             result.update(update)
 
         # Keep 'task' as string - this will be handled specially in collate
-        result["task"] = self.meta.tasks.iloc[item["task_index"]].name
+        task_index = item["task_index"]
+        if isinstance(task_index, torch.Tensor):
+            task_index = int(task_index.item())
+        else:
+            task_index = int(task_index)
+
+        result["task_index"] = task_index
+        result["task"] = self.meta.tasks.iloc[task_index].name
 
         yield result
 
