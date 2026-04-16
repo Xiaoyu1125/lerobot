@@ -15,7 +15,6 @@
 # limitations under the License.
 import dataclasses
 import logging
-import random
 import time
 from contextlib import nullcontext
 from copy import deepcopy
@@ -427,24 +426,28 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    # Split episodes into 95% train / 5% val (non-streaming only)
-    # Or use val_episodes from config when streaming with explicit validation set
+    # Split episodes into train / val (non-streaming)
+    # Align validation selection logic with streaming: respect val_episodes / num_val_episodes from config
     val_dataloader = None
     train_episodes = None
     if not cfg.dataset.streaming:
         total_episodes = dataset.meta.total_episodes
         all_ep_indices = list(range(total_episodes))
-        ep_rng = random.Random(cfg.seed if cfg.seed is not None else 42)
-        ep_rng.shuffle(all_ep_indices)
-        num_val_episodes = max(1, round(0.05 * total_episodes))
-        val_episodes = sorted(all_ep_indices[:num_val_episodes])
-        train_episodes = sorted(all_ep_indices[num_val_episodes:])
+
+        # Determine validation episodes: same priority as streaming path
+        if cfg.dataset.val_episodes is not None:
+            val_episodes = cfg.dataset.val_episodes
+        elif cfg.dataset.num_val_episodes is not None:
+            num_val = cfg.dataset.num_val_episodes
+            val_episodes = sorted(all_ep_indices[:num_val])
+        else:
+            # Default: first episode as validation (matches streaming fallback)
+            val_episodes = [0]
+
+        train_episodes = sorted([ep for ep in all_ep_indices if ep not in val_episodes])
 
         if is_main_process:
-            logging.info(
-                f"Episode split: {len(train_episodes)} train, {len(val_episodes)} val "
-                f"({num_val_episodes / total_episodes * 100:.1f}% val)"
-            )
+            logging.info(f"Episode split: {len(train_episodes)} train, {len(val_episodes)} val")
             logging.info(f"Val episode indices: {val_episodes}")
 
         # Training sampler restricted to train episodes
