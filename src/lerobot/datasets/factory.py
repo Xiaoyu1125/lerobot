@@ -101,6 +101,9 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 tolerance_s=cfg.tolerance_s,
             )
         else:
+            # Use dataset.max_num_shards if specified, otherwise fall back to num_workers
+            max_num_shards = cfg.dataset.max_num_shards if cfg.dataset.max_num_shards is not None else cfg.num_workers
+
             dataset = StreamingLeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
@@ -108,7 +111,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 delta_timestamps=delta_timestamps,
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,
-                max_num_shards=cfg.num_workers,
+                max_num_shards=max_num_shards,
                 tolerance_s=cfg.tolerance_s,
                 buffer_size=cfg.dataset.shuffle_buffer_size,
                 video_backend=cfg.dataset.video_backend,

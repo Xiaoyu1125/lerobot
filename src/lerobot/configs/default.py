@@ -41,6 +41,11 @@ class DatasetConfig:
     video_backend: str = field(default_factory=get_safe_default_codec)
     streaming: bool = False
     shuffle_buffer_size: int = 1000
+    # Maximum number of shards to use for streaming dataset iteration.
+    # This controls the number of shard files each worker randomly samples from.
+    # Increasing this improves randomness but uses more memory and file handles.
+    # If None, defaults to the value of num_workers from TrainPipelineConfig.
+    max_num_shards: int | None = None
 
 
 @dataclass
