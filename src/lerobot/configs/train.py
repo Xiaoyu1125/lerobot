@@ -95,6 +95,7 @@ class TrainPipelineConfig(HubMixin):
     steps: int = 100_000
     eval_freq: int = 20_000
     log_freq: int = 200
+    enable_validation_loss: bool = True
     val_freq: int = 5_000
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True

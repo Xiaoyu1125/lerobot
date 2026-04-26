@@ -426,11 +426,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    # Split episodes into train / val (non-streaming)
-    # Align validation selection logic with streaming: respect val_episodes / num_val_episodes from config
+    # Split episodes into train / val only when validation loss is enabled.
+    # Align validation selection logic with streaming: respect val_episodes / num_val_episodes from config.
     val_dataloader = None
     train_episodes = None
-    if not cfg.dataset.streaming:
+    if not cfg.enable_validation_loss:
+        if is_main_process:
+            logging.info("Validation loss is disabled; skipping validation dataset creation.")
+    elif not cfg.dataset.streaming:
         total_episodes = dataset.meta.total_episodes
         all_ep_indices = list(range(total_episodes))
 
@@ -607,7 +610,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     effective_batch_size = cfg.batch_size * accelerator.num_processes
     # Use train-only frame/episode counts for accurate epoch tracking
     train_num_frames = len(sampler) if sampler is not None else dataset.num_frames
-    train_num_episodes = len(train_episodes) if val_dataloader is not None else dataset.num_episodes
+    train_num_episodes = len(train_episodes) if train_episodes is not None else dataset.num_episodes
     train_tracker = MetricsTracker(
         effective_batch_size,
         train_num_frames,
@@ -693,7 +696,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
-        is_val_step = val_dataloader is not None and cfg.val_freq > 0 and step % cfg.val_freq == 0
+        is_val_step = (
+            cfg.enable_validation_loss
+            and val_dataloader is not None
+            and cfg.val_freq > 0
+            and step % cfg.val_freq == 0
+        )
 
         if is_log_step:
             logging.info(train_tracker)
