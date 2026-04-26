@@ -430,6 +430,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Align validation selection logic with streaming: respect val_episodes / num_val_episodes from config.
     val_dataloader = None
     train_episodes = None
+    sampler = None
     if not cfg.enable_validation_loss:
         if is_main_process:
             logging.info("Validation loss is disabled; skipping validation dataset creation.")
