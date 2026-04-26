@@ -39,6 +39,156 @@ from lerobot.datasets.video_utils import (
 from lerobot.utils.constants import HF_LEROBOT_HOME, LOOKAHEAD_BACKTRACKTABLE, LOOKBACK_BACKTRACKTABLE
 
 
+import os
+import csv
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+class ShuffleOutputRecorder:
+    """
+    Record output order after shuffle buffer.
+
+    x-axis: global output sample i after shuffle buffer
+    y-axis: original dataset index from make_frame(): result["index"]
+    """
+
+    def __init__(
+        self,
+        enable: bool = False,
+        output_dir: str = "outputs/shuffle_debug",
+        filename_prefix: str = "shuffle_output",
+        worker_id: int | None = None,
+        num_workers: int = 1,
+        max_points: int | None = 200_000,
+        index_key: str = "index",
+        flush_every: int = 1000,
+    ):
+        self.enable = enable
+        self.output_dir = output_dir
+        self.filename_prefix = filename_prefix
+        self.worker_id = worker_id
+        self.num_workers = max(1, num_workers)
+        self.max_points = max_points
+        self.index_key = index_key
+        self.flush_every = flush_every
+
+        self.worker_output_sample_i = 0
+        self.rows = []
+
+        if self.enable:
+            os.makedirs(self.output_dir, exist_ok=True)
+
+            self.csv_path = os.path.join(
+                self.output_dir,
+                f"{self.filename_prefix}.csv",
+            )
+            self.png_path = os.path.join(
+                self.output_dir,
+                f"{self.filename_prefix}.png",
+            )
+
+            with open(self.csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["output_sample_i", "worker_output_sample_i", "data_index"])
+
+    def _worker_suffix(self) -> str:
+        return f" [worker {self.worker_id}]" if self.worker_id is not None else ""
+
+    def _global_output_sample_i(self) -> int:
+        if self.worker_id is None or self.num_workers <= 1:
+            return self.worker_output_sample_i
+        return self.worker_output_sample_i * self.num_workers + self.worker_id
+
+    def _to_int(self, value):
+        """
+        Convert torch.Tensor / numpy scalar / python int to int.
+        make_frame() gives result["index"] from item["index"].
+        """
+        if hasattr(value, "detach"):
+            value = value.detach().cpu()
+
+        if hasattr(value, "item"):
+            value = value.item()
+
+        return int(value)
+
+    def _get_data_index(self, sample):
+        """
+        According to make_frame(), sample should contain:
+
+            sample["index"]
+
+        This is the original dataset index.
+        """
+        if self.index_key not in sample:
+            return None
+
+        return self._to_int(sample[self.index_key])
+
+    def record(self, sample):
+        if not self.enable:
+            return
+
+        if self.max_points is not None and self.worker_output_sample_i >= self.max_points:
+            self.worker_output_sample_i += 1
+            return
+
+        data_index = self._get_data_index(sample)
+
+        if data_index is None:
+            self.worker_output_sample_i += 1
+            return
+
+        self.rows.append((self._global_output_sample_i(), self.worker_output_sample_i, data_index))
+        self.worker_output_sample_i += 1
+
+        if len(self.rows) >= self.flush_every:
+            self.flush()
+
+    def flush(self):
+        if not self.enable or len(self.rows) == 0:
+            return
+
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerows(self.rows)
+
+        self.rows.clear()
+
+    def save_plot(self):
+        if not self.enable:
+            return
+
+        self.flush()
+
+        xs = []
+        ys = []
+
+        with open(self.csv_path, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                xs.append(int(row["output_sample_i"]))
+                ys.append(int(row["data_index"]))
+
+        if len(xs) == 0:
+            print("[ShuffleOutputRecorder] No data recorded.")
+            return
+
+        plt.figure(figsize=(12, 6))
+        plt.scatter(xs, ys, s=1)
+        plt.xlabel("Global output sample i after shuffle buffer")
+        plt.ylabel("Original dataset index")
+        plt.title(f"Shuffle buffer output distribution{self._worker_suffix()}")
+        plt.tight_layout()
+        plt.savefig(self.png_path, dpi=200)
+        plt.close()
+
+        print(f"[ShuffleOutputRecorder]{self._worker_suffix()} Recorded {len(xs)} samples.")
+        print(f"[ShuffleOutputRecorder]{self._worker_suffix()} Saved csv to: {self.csv_path}")
+        print(f"[ShuffleOutputRecorder]{self._worker_suffix()} Saved plot to: {self.png_path}")
+
 class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     """LeRobotDataset with streaming capabilities.
 
@@ -131,6 +281,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         self.streaming = streaming
         self.buffer_size = buffer_size
         self.video_backend = video_backend
+        self.max_num_shards = max_num_shards
 
         # We cache the video decoders to avoid re-initializing them at each frame (avoiding a ~10x slowdown)
         self.video_decoder_cache = None
@@ -235,6 +386,22 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         if self.video_decoder_cache is None:
             self.video_decoder_cache = VideoDecoderCache()
 
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        has_multiple_workers = worker_info is not None and worker_info.num_workers > 1
+        prefix = f"shuffle_buffer{self.buffer_size}_shards{self.max_num_shards}"
+        if has_multiple_workers:
+            prefix = f"{prefix}_worker{worker_id}"
+        self.shuffle_output_recorder = ShuffleOutputRecorder(
+            enable=True,
+            output_dir="outputs/shuffle_debug",
+            filename_prefix=prefix,
+            worker_id=worker_id if has_multiple_workers else None,
+            num_workers=worker_info.num_workers if worker_info is not None else 1,
+            max_points=200_000,
+            index_key="index",
+        )
+
         # Infinite iteration for training with accelerator.prepare()
         while True:
             # keep the same seed across exhaustions if shuffle is False, otherwise shuffle data across exhaustions
@@ -247,13 +414,11 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 for idx in range(self.num_shards)
             }
 
-
             # This buffer is populated while iterating on the dataset's shards
             # the logic is to add 2 levels of randomness:
             # (1) sample one shard at random from the ones available, and
             # (2) sample one frame from the shard sampled at (1)
             frames_buffer = []
-            frame_idx = 0
 
             while available_shards := list(idx_to_backtrack_dataset.keys()):
                 shard_key = next(self._infinite_generator_over_elements(rng, available_shards))
@@ -262,34 +427,53 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 try:
                     for frame in self.make_frame(backtrack_dataset):
                         if len(frames_buffer) == self.buffer_size:
-                            i = next(buffer_indices_generator)  # samples a element from the buffer
-                            yield frames_buffer[i]
+                            i = next(buffer_indices_generator)
+
+                            out_frame = frames_buffer[i]
+                            self.shuffle_output_recorder.record(out_frame)
+
+                            yield out_frame
+
                             frames_buffer[i] = frame
                         else:
                             frames_buffer.append(frame)
-                        frame_idx += 1
                         break  # random shard sampled, switch shard
                 except StopIteration:
-                    # Shard is exhausted, remove it and continue with next shard
                     del idx_to_backtrack_dataset[shard_key]
                 except (FileNotFoundError, Exception) as e:
-                    # Log the error for debugging but remove the shard to continue
                     import logging
-                    logging.error(f"Error loading from shard {shard_key}: {type(e).__name__}: {e}")
-                    del idx_to_backtrack_dataset[shard_key]  # Remove problematic shard, onto another shard
+
+                    logging.error(
+                        f"Error loading from shard {shard_key}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    del idx_to_backtrack_dataset[shard_key]
 
             # Once shards are all exhausted, shuffle the buffer and yield the remaining frames
             rng.shuffle(frames_buffer)
 
-            # If no frames were collected, this indicates a problem with the dataset
             if len(frames_buffer) == 0:
                 import logging
-                logging.error(f"No frames collected from any shard! This indicates a problem with the dataset loading.")
-                logging.error(f"Available shards: {list(idx_to_backtrack_dataset.keys())}")
-                raise RuntimeError("Failed to load any frames from the streaming dataset. Check logs for details.")
 
-            yield from frames_buffer
+                logging.error(
+                    "No frames collected from any shard! "
+                    "This indicates a problem with the dataset loading."
+                )
+                logging.error(
+                    f"Available shards: {list(idx_to_backtrack_dataset.keys())}"
+                )
+                raise RuntimeError(
+                    "Failed to load any frames from the streaming dataset. "
+                    "Check logs for details."
+                )
 
+            for out_frame in frames_buffer:
+                self.shuffle_output_recorder.record(out_frame)
+                yield out_frame
+
+            # 每轮数据遍历结束后保存一次图
+            self.shuffle_output_recorder.save_plot()
+            
     def _get_window_steps(
         self, delta_timestamps: dict[str, list[float]] | None = None, dynamic_bounds: bool = False
     ) -> tuple[int, int]:
@@ -416,6 +600,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         result = item.copy()
         for update in updates:
             result.update(update)
+
+        # Keep original dataset index for shuffle-buffer visualization
+        result["index"] = item["index"]
 
         # Keep 'task' as string - this will be handled specially in collate
         task_index = item["task_index"]

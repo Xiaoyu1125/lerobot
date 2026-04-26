@@ -17,6 +17,7 @@ import logging
 import re
 from itertools import chain
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -496,6 +497,39 @@ def test_factory(env_name, repo_id, policy_name):
         # test missing keys in delta_timestamps
         for key in delta_timestamps:
             assert key in item, f"{key}"
+
+
+def test_streaming_factory_passes_dataset_seed(monkeypatch):
+    captured = {}
+
+    class FakeStreamingDataset:
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            self.meta = SimpleNamespace(camera_keys=[], stats={})
+
+    class FakeMetadata:
+        def __init__(self, *args, **kwargs):
+            self.features = {}
+            self.camera_keys = []
+            self.stats = {}
+
+    monkeypatch.setattr("lerobot.datasets.factory.StreamingLeRobotDataset", FakeStreamingDataset)
+    monkeypatch.setattr("lerobot.datasets.factory.LeRobotDatasetMetadata", FakeMetadata)
+
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(
+            repo_id="dummy/repo",
+            streaming=True,
+            seed=123,
+            use_imagenet_stats=False,
+        ),
+        policy=make_policy_config("act"),
+    )
+
+    make_dataset(cfg)
+
+    assert captured["kwargs"]["seed"] == 123
 
 
 # TODO(alexander-soare): If you're hunting for savings on testing time, this takes about 5 seconds.

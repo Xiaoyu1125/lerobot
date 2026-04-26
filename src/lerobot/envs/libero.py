@@ -116,6 +116,7 @@ class LiberoEnv(gym.Env):
         camera_name_mapping: dict[str, str] | None = None,
         num_steps_wait: int = 10,
         control_mode: str = "relative",
+        control_freq: int = 20,
     ):
         super().__init__()
         self.task_id = task_id
@@ -144,6 +145,8 @@ class LiberoEnv(gym.Env):
         self.num_steps_wait = num_steps_wait
         self.episode_index = episode_index
         self.episode_length = episode_length
+        self.control_freq = control_freq
+        self.metadata = {**type(self).metadata, "render_fps": control_freq}
         # Load once and keep
         self._init_states = get_task_init_states(task_suite, self.task_id) if self.init_states else None
         self._reset_stride = n_envs  # when performing a reset, append `_reset_stride` to `init_state_id`.
@@ -237,6 +240,7 @@ class LiberoEnv(gym.Env):
             "bddl_file_name": task_bddl_file,
             "camera_heights": self.observation_height,
             "camera_widths": self.observation_width,
+            "control_freq": self.control_freq,
         }
         env = OffScreenRenderEnv(**env_args)
         env.reset()
@@ -364,6 +368,7 @@ def _make_env_fns(
     init_states: bool,
     gym_kwargs: Mapping[str, Any],
     control_mode: str,
+    control_freq: int,
 ) -> list[Callable[[], LiberoEnv]]:
     """Build n_envs factory callables for a single (suite, task_id)."""
 
@@ -379,6 +384,7 @@ def _make_env_fns(
             episode_index=episode_index,
             n_envs=n_envs,
             control_mode=control_mode,
+            control_freq=control_freq,
             **local_kwargs,
         )
 
@@ -400,6 +406,7 @@ def create_libero_envs(
     env_cls: Callable[[Sequence[Callable[[], Any]]], Any] | None = None,
     control_mode: str = "relative",
     episode_length: int | None = None,
+    control_freq: int = 20,
 ) -> dict[str, dict[int, Any]]:
     """
     Create vectorized LIBERO environments with a consistent return shape.
@@ -449,6 +456,7 @@ def create_libero_envs(
                 init_states=init_states,
                 gym_kwargs=gym_kwargs,
                 control_mode=control_mode,
+                control_freq=control_freq,
             )
             out[suite_name][tid] = env_cls(fns)
             print(f"Built vec env | suite={suite_name} | task_id={tid} | n_envs={n_envs}")
