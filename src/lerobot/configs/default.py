@@ -43,6 +43,10 @@ class DatasetConfig:
     video_backend: str = field(default_factory=get_safe_default_codec)
     streaming: bool = False
     shuffle_buffer_size: int = 1000
+    # Storage batch size used by Lance-backed streaming reads. This is not the GPU training batch size.
+    raw_batch_size: int | None = None
+    # Device used to decode Lance-backed image bytes. Use "cpu" when DataLoader pin_memory is enabled.
+    lance_decode_device: str | None = "cpu"
     # Maximum number of shards to use for streaming dataset iteration.
     # This controls the number of shard files each worker randomly samples from.
     # Increasing this improves randomness but uses more memory and file handles.

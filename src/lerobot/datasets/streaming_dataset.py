@@ -14,7 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections.abc import Callable, Generator, Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
+import sys
 
 import datasets
 import numpy as np
@@ -37,20 +39,25 @@ from lerobot.datasets.video_utils import (
     VideoDecoderCache,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME, LOOKAHEAD_BACKTRACKTABLE, LOOKBACK_BACKTRACKTABLE
+from lerobot.utils.profiler_trace import dataloader_trace
 
 
 import os
 import csv
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    plt = None
 
 class ShuffleOutputRecorder:
     """
-    Record output order after shuffle buffer.
+    Record batch order consumed by the main training loop.
 
-    x-axis: global output sample i after shuffle buffer
+    x-axis: batch index before the batch is sent through the training preprocessor
     y-axis: original dataset index from make_frame(): result["index"]
     """
 
@@ -59,22 +66,20 @@ class ShuffleOutputRecorder:
         enable: bool = False,
         output_dir: str = "outputs/shuffle_debug",
         filename_prefix: str = "shuffle_output",
-        worker_id: int | None = None,
-        num_workers: int = 1,
         max_points: int | None = 200_000,
         index_key: str = "index",
+        worker_id_key: str = "worker_id",
         flush_every: int = 1000,
     ):
         self.enable = enable
         self.output_dir = output_dir
         self.filename_prefix = filename_prefix
-        self.worker_id = worker_id
-        self.num_workers = max(1, num_workers)
         self.max_points = max_points
         self.index_key = index_key
+        self.worker_id_key = worker_id_key
         self.flush_every = flush_every
 
-        self.worker_output_sample_i = 0
+        self.num_recorded_samples = 0
         self.rows = []
 
         if self.enable:
@@ -91,15 +96,7 @@ class ShuffleOutputRecorder:
 
             with open(self.csv_path, "w", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(["output_sample_i", "worker_output_sample_i", "data_index"])
-
-    def _worker_suffix(self) -> str:
-        return f" [worker {self.worker_id}]" if self.worker_id is not None else ""
-
-    def _global_output_sample_i(self) -> int:
-        if self.worker_id is None or self.num_workers <= 1:
-            return self.worker_output_sample_i
-        return self.worker_output_sample_i * self.num_workers + self.worker_id
+                writer.writerow(["data_index", "batch_index", "worker_id"])
 
     def _to_int(self, value):
         """
@@ -114,35 +111,34 @@ class ShuffleOutputRecorder:
 
         return int(value)
 
-    def _get_data_index(self, sample):
-        """
-        According to make_frame(), sample should contain:
+    def _to_int_list(self, values):
+        if hasattr(values, "detach"):
+            values = values.detach().cpu()
 
-            sample["index"]
+        if hasattr(values, "tolist"):
+            values = values.tolist()
 
-        This is the original dataset index.
-        """
-        if self.index_key not in sample:
-            return None
+        if not isinstance(values, list):
+            values = [values]
 
-        return self._to_int(sample[self.index_key])
+        return [self._to_int(value) for value in values]
 
-    def record(self, sample):
+    def record_batch(self, batch, batch_index: int):
         if not self.enable:
             return
 
-        if self.max_points is not None and self.worker_output_sample_i >= self.max_points:
-            self.worker_output_sample_i += 1
+        if self.index_key not in batch or self.worker_id_key not in batch:
             return
 
-        data_index = self._get_data_index(sample)
+        data_indices = self._to_int_list(batch[self.index_key])
+        worker_ids = self._to_int_list(batch[self.worker_id_key])
 
-        if data_index is None:
-            self.worker_output_sample_i += 1
-            return
+        for data_index, worker_id in zip(data_indices, worker_ids, strict=False):
+            if self.max_points is not None and self.num_recorded_samples >= self.max_points:
+                break
 
-        self.rows.append((self._global_output_sample_i(), self.worker_output_sample_i, data_index))
-        self.worker_output_sample_i += 1
+            self.rows.append((data_index, batch_index, worker_id))
+            self.num_recorded_samples += 1
 
         if len(self.rows) >= self.flush_every:
             self.flush()
@@ -162,6 +158,9 @@ class ShuffleOutputRecorder:
             return
 
         self.flush()
+        if plt is None:
+            print("[ShuffleOutputRecorder] matplotlib is not installed; skipped plot generation.")
+            return
 
         xs = []
         ys = []
@@ -169,7 +168,7 @@ class ShuffleOutputRecorder:
         with open(self.csv_path, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                xs.append(int(row["output_sample_i"]))
+                xs.append(int(row["batch_index"]))
                 ys.append(int(row["data_index"]))
 
         if len(xs) == 0:
@@ -178,16 +177,16 @@ class ShuffleOutputRecorder:
 
         plt.figure(figsize=(12, 6))
         plt.scatter(xs, ys, s=1)
-        plt.xlabel("Global output sample i after shuffle buffer")
+        plt.xlabel("Batch index consumed by training loop")
         plt.ylabel("Original dataset index")
-        plt.title(f"Shuffle buffer output distribution{self._worker_suffix()}")
+        plt.title("Shuffle buffer output distribution")
         plt.tight_layout()
         plt.savefig(self.png_path, dpi=200)
         plt.close()
 
-        print(f"[ShuffleOutputRecorder]{self._worker_suffix()} Recorded {len(xs)} samples.")
-        print(f"[ShuffleOutputRecorder]{self._worker_suffix()} Saved csv to: {self.csv_path}")
-        print(f"[ShuffleOutputRecorder]{self._worker_suffix()} Saved plot to: {self.png_path}")
+        print(f"[ShuffleOutputRecorder] Recorded {len(xs)} samples.")
+        print(f"[ShuffleOutputRecorder] Saved csv to: {self.csv_path}")
+        print(f"[ShuffleOutputRecorder] Saved plot to: {self.png_path}")
 
 class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     """LeRobotDataset with streaming capabilities.
@@ -244,6 +243,8 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         rng: np.random.Generator | None = None,
         shuffle: bool = True,
         video_backend: str = "pyav",
+        raw_batch_size: int | None = None,
+        lance_decode_device: str | torch.device | None = "auto",
     ):
         """Initialize a StreamingLeRobotDataset.
 
@@ -264,11 +265,16 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             shuffle (bool, optional): Whether to shuffle the dataset across exhaustions. Defaults to True.
             video_backend (str, optional): Video backend to use for decoding. Defaults to "pyav".
                 Options: "pyav" (recommended), "torchcodec" (may have issues with AV1 on some platforms).
+            raw_batch_size (int | None, optional): Storage batch size for Lance-backed streaming reads.
+            lance_decode_device (str | torch.device | None, optional): Device used by the Lance backend
+                for image decoding. Defaults to "auto", which lets the Lance dataset choose CUDA when
+                available.
         """
         super().__init__()
         self.repo_id = repo_id
         self.root = Path(root) if root else HF_LEROBOT_HOME / repo_id
         self.streaming_from_local = root is not None
+        self.use_lance_backend = self._looks_like_lance_root(self.root)
 
         self.image_transforms = image_transforms
         self.episodes = episodes
@@ -280,8 +286,16 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         self.streaming = streaming
         self.buffer_size = buffer_size
+        self.raw_batch_size = int(
+            raw_batch_size
+            if raw_batch_size is not None
+            else os.environ.get("LEROBOT_STREAMING_RAW_BATCH_SIZE", buffer_size)
+        )
+        self.lance_decode_device = lance_decode_device
         self.video_backend = video_backend
         self.max_num_shards = max_num_shards
+        self.shuffle_output_recorder = None
+        self.lance_dataset = None
 
         # We cache the video decoders to avoid re-initializing them at each frame (avoiding a ~10x slowdown)
         self.video_decoder_cache = None
@@ -303,20 +317,29 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             self.delta_timestamps = delta_timestamps
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
 
-        self.hf_dataset: datasets.IterableDataset = load_dataset(
-            self.repo_id if not self.streaming_from_local else str(self.root),
-            split="train",
-            streaming=self.streaming,
-            data_files="data/*/*.parquet",
-            revision=self.revision,
-        )
+        if self.use_lance_backend:
+            self.hf_dataset = None
+            self.lance_dataset = self._make_lance_dataset()
+        else:
+            self.hf_dataset: datasets.IterableDataset = load_dataset(
+                self.repo_id if not self.streaming_from_local else str(self.root),
+                split="train",
+                streaming=self.streaming,
+                data_files="data/*/*.parquet",
+                revision=self.revision,
+            )
 
         import logging
-        logging.info(f"Streaming dataset loaded: streaming={self.streaming}, streaming_from_local={self.streaming_from_local}")
+        logging.info(
+            f"Streaming dataset loaded: streaming={self.streaming}, "
+            f"streaming_from_local={self.streaming_from_local}, use_lance_backend={self.use_lance_backend}"
+        )
         logging.info(f"Dataset root: {self.root}")
 
         # num_shards is only available for IterableDataset (streaming=True)
-        if self.streaming:
+        if self.use_lance_backend:
+            self.num_shards = 1
+        elif self.streaming:
             self.num_shards = min(self.hf_dataset.num_shards, max_num_shards)
             logging.info(f"Dataset num_shards: {self.hf_dataset.num_shards}, using max_num_shards: {max_num_shards}")
             # Ensure at least 1 shard so the iterator loop can run (num_workers=0 => max_num_shards=0)
@@ -342,29 +365,51 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         return self.meta.fps
 
     @staticmethod
+    def _looks_like_lance_root(root: Path) -> bool:
+        return root.suffix == ".lance" or (root.is_dir() and any(root.glob("*.lance")))
+
+    def _make_lance_dataset(self):
+        try:
+            from lerobot_lancedb.dataset import LeRobotLanceDataset
+        except ModuleNotFoundError:
+            sibling_src = Path.home() / "lerobot_lancedb" / "src"
+            if sibling_src.exists() and str(sibling_src) not in sys.path:
+                sys.path.insert(0, str(sibling_src))
+            from lerobot_lancedb.dataset import LeRobotLanceDataset
+
+        return LeRobotLanceDataset(
+            root=self.root,
+            episodes=self.episodes,
+            delta_timestamps=None,
+            image_transforms=None,
+            decode_device=self.lance_decode_device,
+        )
+
+    @staticmethod
     def collate_fn(batch: list[dict]) -> dict:
         import torch
         import numpy as np
 
-        collated = {}
+        with torch.profiler.record_function("dataloader_collate"), dataloader_trace("dataloader_collate"):
+            collated = {}
 
-        for key in batch[0].keys():
-            # Do not pass raw task strings through accelerate
-            if key == "task":
-                continue
+            for key in batch[0].keys():
+                # Do not pass raw task strings through accelerate
+                if key == "task":
+                    continue
 
-            values = [item[key] for item in batch]
+                values = [item[key] for item in batch]
 
-            if isinstance(values[0], torch.Tensor):
-                collated[key] = torch.stack(values)
-            else:
-                try:
-                    arr = np.stack(values)
-                    collated[key] = torch.from_numpy(arr)
-                except Exception:
-                    collated[key] = values
+                if isinstance(values[0], torch.Tensor):
+                    collated[key] = torch.stack(values)
+                else:
+                    try:
+                        arr = np.stack(values)
+                        collated[key] = torch.from_numpy(arr)
+                    except Exception:
+                        collated[key] = values
 
-        return collated    
+            return collated
     
     @staticmethod
     def _iter_random_indices(
@@ -383,96 +428,401 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     # could be used with a ThreadPoolExecutor to run `make_frame` (especially video decoding)
     # in parallel, feeding a queue from which this iterator will yield processed items.
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        if self.use_lance_backend:
+            yield from self._iter_lance()
+            return
+
         if self.video_decoder_cache is None:
             self.video_decoder_cache = VideoDecoderCache()
 
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
-        has_multiple_workers = worker_info is not None and worker_info.num_workers > 1
-        prefix = f"shuffle_buffer{self.buffer_size}_shards{self.max_num_shards}"
-        if has_multiple_workers:
-            prefix = f"{prefix}_worker{worker_id}"
-        self.shuffle_output_recorder = ShuffleOutputRecorder(
-            enable=True,
-            output_dir="outputs/shuffle_debug",
-            filename_prefix=prefix,
-            worker_id=worker_id if has_multiple_workers else None,
-            num_workers=worker_info.num_workers if worker_info is not None else 1,
-            max_points=200_000,
-            index_key="index",
+        make_torch_workers = max(1, int(os.environ.get("LEROBOT_STREAMING_MAKE_TORCH_WORKERS", "4")))
+        max_pending_frames = max(
+            1,
+            int(os.environ.get("LEROBOT_STREAMING_MAKE_TORCH_PREFETCH", str(make_torch_workers * 2))),
         )
+        print("make_torch_workers:", make_torch_workers)
+        print("max_pending_frames:", max_pending_frames)
+        pending_frames: set[Future] = set()
+        future_to_buffer_id: dict[Future, int | None] = {}
+        locked_buffer_ids: set[int] = set()
+        include_worker_id = os.environ.get("LEROBOT_STREAMING_INCLUDE_WORKER_ID") == "1"
 
-        # Infinite iteration for training with accelerator.prepare()
-        while True:
-            # keep the same seed across exhaustions if shuffle is False, otherwise shuffle data across exhaustions
-            rng = np.random.default_rng(self.seed) if not self.shuffle else self.rng
+        def set_worker_id(frame):
+            if include_worker_id:
+                frame["worker_id"] = worker_id
+            return frame
 
-            buffer_indices_generator = self._iter_random_indices(rng, self.buffer_size)
+        def pop_finished_frames(block: bool = False) -> list[dict[str, torch.Tensor]]:
+            if len(pending_frames) == 0:
+                return []
 
-            idx_to_backtrack_dataset = {
-                idx: self._make_backtrackable_dataset(safe_shard(self.hf_dataset, idx, self.num_shards))
-                for idx in range(self.num_shards)
-            }
+            if block:
+                done, _ = wait(pending_frames, return_when=FIRST_COMPLETED)
+            else:
+                done = {future for future in pending_frames if future.done()}
 
-            # This buffer is populated while iterating on the dataset's shards
-            # the logic is to add 2 levels of randomness:
-            # (1) sample one shard at random from the ones available, and
-            # (2) sample one frame from the shard sampled at (1)
-            frames_buffer = []
+            out_frames = []
+            for future in done:
+                pending_frames.remove(future)
+                future_to_buffer_id.pop(future, None)
+                out_frames.append(future.result())
 
-            while available_shards := list(idx_to_backtrack_dataset.keys()):
-                shard_key = next(self._infinite_generator_over_elements(rng, available_shards))
-                backtrack_dataset = idx_to_backtrack_dataset[shard_key]  # selects which shard to iterate on
+            return out_frames
 
-                try:
-                    for frame in self.make_frame(backtrack_dataset):
-                        if len(frames_buffer) == self.buffer_size:
-                            i = next(buffer_indices_generator)
+        def submit_torch_frame(executor: ThreadPoolExecutor, sample: dict, buffer_id: int | None) -> None:
+            future = executor.submit(self.make_torch_frame, sample)
+            pending_frames.add(future)
+            future_to_buffer_id[future] = buffer_id
 
-                            out_frame = frames_buffer[i]
-                            self.shuffle_output_recorder.record(out_frame)
+        def next_unlocked_buffer_index(buffer_indices_generator: Iterator[int]) -> int:
+            while True:
+                i = next(buffer_indices_generator)
+                if i not in locked_buffer_ids:
+                    return i
 
+        with ThreadPoolExecutor(
+            max_workers=make_torch_workers, thread_name_prefix="make_torch_frame"
+        ) as make_torch_executor:
+            # Infinite iteration for training with accelerator.prepare()
+            while True:
+                # keep the same seed across exhaustions if shuffle is False, otherwise shuffle data across exhaustions
+                rng = np.random.default_rng(self.seed) if not self.shuffle else self.rng
+
+                buffer_indices_generator = self._iter_random_indices(rng, self.buffer_size)
+
+                idx_to_backtrack_dataset = {
+                    idx: self._make_backtrackable_dataset(safe_shard(self.hf_dataset, idx, self.num_shards))
+                    for idx in range(self.num_shards)
+                }
+
+                # This buffer is populated while iterating on the dataset's shards
+                # the logic is to add 2 levels of randomness:
+                # (1) sample one shard at random from the ones available, and
+                # (2) sample one frame from the shard sampled at (1)
+                frames_buffer = []
+
+                while available_shards := list(idx_to_backtrack_dataset.keys()):
+                    while len(pending_frames) >= max_pending_frames:
+                        for out_frame in pop_finished_frames(block=True):
                             yield out_frame
 
-                            frames_buffer[i] = frame
+                    for out_frame in pop_finished_frames(block=False):
+                        yield out_frame
+
+                    shard_key = next(self._infinite_generator_over_elements(rng, available_shards))
+                    backtrack_dataset = idx_to_backtrack_dataset[shard_key]  # selects which shard to iterate on
+
+                    try:
+                        sample = self.get_sample(backtrack_dataset)
+                        sample = set_worker_id(sample)
+                        if len(frames_buffer) == self.buffer_size:
+                            i = next_unlocked_buffer_index(buffer_indices_generator)
+                            locked_buffer_ids.add(i)
+                            try:
+                                out_sample = frames_buffer[i]
+                                frames_buffer[i] = sample
+                            finally:
+                                locked_buffer_ids.remove(i)
+
+                            submit_torch_frame(make_torch_executor, out_sample, i)
                         else:
-                            frames_buffer.append(frame)
-                        break  # random shard sampled, switch shard
-                except StopIteration:
-                    del idx_to_backtrack_dataset[shard_key]
-                except (FileNotFoundError, Exception) as e:
+                            frames_buffer.append(sample)
+                    except StopIteration:
+                        del idx_to_backtrack_dataset[shard_key]
+                    except FileNotFoundError as e:
+                        import logging
+
+                        logging.error(
+                            f"Error loading from shard {shard_key}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        del idx_to_backtrack_dataset[shard_key]
+
+                # Once shards are all exhausted, shuffle the buffer and yield the remaining frames
+                rng.shuffle(frames_buffer)
+
+                if len(frames_buffer) == 0:
                     import logging
 
                     logging.error(
-                        f"Error loading from shard {shard_key}: "
-                        f"{type(e).__name__}: {e}"
+                        "No frames collected from any shard! "
+                        "This indicates a problem with the dataset loading."
                     )
-                    del idx_to_backtrack_dataset[shard_key]
+                    logging.error(
+                        f"Available shards: {list(idx_to_backtrack_dataset.keys())}"
+                    )
+                    raise RuntimeError(
+                        "Failed to load any frames from the streaming dataset. "
+                        "Check logs for details."
+                    )
 
-            # Once shards are all exhausted, shuffle the buffer and yield the remaining frames
-            rng.shuffle(frames_buffer)
+                for out_sample in frames_buffer:
+                    while len(pending_frames) >= max_pending_frames:
+                        for out_frame in pop_finished_frames(block=True):
+                            yield out_frame
 
-            if len(frames_buffer) == 0:
-                import logging
+                    submit_torch_frame(make_torch_executor, out_sample, None)
 
-                logging.error(
-                    "No frames collected from any shard! "
-                    "This indicates a problem with the dataset loading."
-                )
-                logging.error(
-                    f"Available shards: {list(idx_to_backtrack_dataset.keys())}"
-                )
-                raise RuntimeError(
-                    "Failed to load any frames from the streaming dataset. "
-                    "Check logs for details."
-                )
+                    for out_frame in pop_finished_frames(block=False):
+                        yield out_frame
 
-            for out_frame in frames_buffer:
-                self.shuffle_output_recorder.record(out_frame)
-                yield out_frame
+                while len(pending_frames) > 0:
+                    for out_frame in pop_finished_frames(block=True):
+                        yield out_frame
 
-            # 每轮数据遍历结束后保存一次图
-            self.shuffle_output_recorder.save_plot()
+    @staticmethod
+    def _item_int(item: dict, key: str) -> int:
+        value = item[key]
+        if hasattr(value, "detach"):
+            value = value.detach().cpu()
+        if hasattr(value, "item"):
+            value = value.item()
+        return int(value)
+
+    def _episode_bounds_for_item(self, item: dict) -> tuple[int, int]:
+        ep_idx = self._item_int(item, "episode_index")
+        ep = self.meta.episodes[ep_idx]
+        return int(ep["dataset_from_index"]), int(ep["dataset_to_index"])
+
+    def _lance_delta_sample(self, item: dict, waiting_buffer: dict[int, dict]) -> dict:
+        if self.delta_indices is None:
+            return item.copy()
+
+        current_index = self._item_int(item, "index")
+        current_episode = self._item_int(item, "episode_index")
+        ep_start, ep_end = self._episode_bounds_for_item(item)
+        result = item.copy()
+
+        for key, delta_indices in self.delta_indices.items():
+            frames = []
+            is_pad = []
+            last_frame = item[key]
+
+            for delta in delta_indices:
+                query_index = current_index + int(delta)
+                clamped_index = max(ep_start, min(ep_end - 1, query_index))
+                query_item = waiting_buffer.get(clamped_index)
+                padded = query_index != clamped_index
+
+                if query_item is None or self._item_int(query_item, "episode_index") != current_episode:
+                    query_item = item
+                    padded = True
+
+                frame = query_item[key]
+                frames.append(frame)
+                is_pad.append(padded)
+                if not padded:
+                    last_frame = frame
+
+            result[key] = frames if frames else last_frame
+            result[f"{key}_is_pad"] = is_pad
+
+        return result
+
+    def make_lance_torch_frame(self, sample: dict) -> dict:
+        """Decode Lance image bytes and convert a shuffled raw sample to tensors."""
+        result = self.lance_dataset.decode_raw_sample_images(sample)
+
+        if self.image_transforms is not None:
+            with torch.profiler.record_function("dataloader_image_transforms"), dataloader_trace(
+                "dataloader_image_transforms"
+            ):
+                for cam in self.meta.camera_keys:
+                    if cam in result:
+                        result[cam] = self.image_transforms(result[cam])
+
+        task_index = result["task_index"]
+        if isinstance(task_index, torch.Tensor):
+            task_index = int(task_index.item())
+        else:
+            task_index = int(task_index)
+        result["task_index"] = task_index
+        result["task"] = self.meta.tasks.iloc[task_index].name
+        return item_to_torch(result)
+
+    def _make_lance_torch_frame(self, sample: dict) -> dict:
+        return self.make_lance_torch_frame(sample)
+
+    def _iter_lance(self) -> Iterator[dict[str, torch.Tensor]]:
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        make_torch_workers = max(1, int(os.environ.get("LEROBOT_STREAMING_MAKE_TORCH_WORKERS", "4")))
+        max_pending_frames = max(
+            1,
+            int(os.environ.get("LEROBOT_STREAMING_MAKE_TORCH_PREFETCH", str(make_torch_workers * 2))),
+        )
+        pending_frames: set[Future] = set()
+        future_to_buffer_id: dict[Future, int | None] = {}
+        locked_buffer_ids: set[int] = set()
+        include_worker_id = os.environ.get("LEROBOT_STREAMING_INCLUDE_WORKER_ID") == "1"
+
+        def pop_finished_frames(block: bool = False) -> list[dict[str, torch.Tensor]]:
+            if len(pending_frames) == 0:
+                return []
+            if block:
+                done, _ = wait(pending_frames, return_when=FIRST_COMPLETED)
+            else:
+                done = {future for future in pending_frames if future.done()}
+
+            out_frames = []
+            for future in done:
+                pending_frames.remove(future)
+                future_to_buffer_id.pop(future, None)
+                out_frames.append(future.result())
+            return out_frames
+
+        def submit_torch_frame(executor: ThreadPoolExecutor, sample: dict, buffer_id: int | None) -> None:
+            future = executor.submit(self._make_lance_torch_frame, sample)
+            pending_frames.add(future)
+            future_to_buffer_id[future] = buffer_id
+
+        def next_unlocked_buffer_index(buffer_indices_generator: Iterator[int]) -> int:
+            while True:
+                i = next(buffer_indices_generator)
+                if i not in locked_buffer_ids:
+                    return i
+
+        max_positive_delta = 0
+        max_negative_delta = 0
+        if self.delta_indices is not None:
+            all_delta_indices = [int(delta) for deltas in self.delta_indices.values() for delta in deltas]
+            if all_delta_indices:
+                max_positive_delta = max(0, max(all_delta_indices))
+                max_negative_delta = abs(min(0, min(all_delta_indices)))
+
+        with ThreadPoolExecutor(
+            max_workers=make_torch_workers, thread_name_prefix="make_lance_torch_frame"
+        ) as make_torch_executor:
+            while True:
+                rng = np.random.default_rng(self.seed) if not self.shuffle else self.rng
+                buffer_indices_generator = self._iter_random_indices(rng, self.buffer_size)
+                frames_buffer = []
+                waiting_buffer: dict[int, dict] = {}
+                pending_base_indices: list[int] = []
+                exhausted = False
+
+                frames_per_worker = (self.num_frames + num_workers - 1) // num_workers
+                worker_start = min(worker_id * frames_per_worker, self.num_frames)
+                worker_stop = min(worker_start + frames_per_worker, self.num_frames)
+                if worker_start >= worker_stop:
+                    return
+                read_start = max(0, worker_start - max_negative_delta)
+                read_stop = min(self.num_frames, worker_stop + max_positive_delta)
+                self.lance_dataset.reset_raw_batch_cursor(read_start, read_stop)
+
+                def required_delta_indices(item_index: int) -> list[int]:
+                    if self.delta_indices is None:
+                        return []
+                    item = waiting_buffer[item_index]
+                    ep_start, ep_end = self._episode_bounds_for_item(item)
+                    required = []
+                    for delta_indices in self.delta_indices.values():
+                        for delta in delta_indices:
+                            query_index = item_index + int(delta)
+                            clamped_index = max(ep_start, min(ep_end - 1, query_index))
+                            required.append(clamped_index)
+                    return required
+
+                def sample_is_ready(item_index: int) -> bool:
+                    if exhausted:
+                        return True
+                    return all(query_index in waiting_buffer for query_index in required_delta_indices(item_index))
+
+                while not exhausted or pending_base_indices:
+                    while not exhausted:
+                        raw_batch = self.lance_dataset.load_next_raw_batch(
+                            self.raw_batch_size, decode_images=False
+                        )
+                        if not raw_batch:
+                            exhausted = True
+                            break
+
+                        for raw_item in raw_batch:
+                            item_index = self._item_int(raw_item, "index")
+                            waiting_buffer[item_index] = raw_item
+                            if worker_start <= item_index < worker_stop:
+                                pending_base_indices.append(item_index)
+
+                        if any(sample_is_ready(item_index) for item_index in pending_base_indices):
+                            break
+
+                    ready_indices = [
+                        item_index for item_index in pending_base_indices if sample_is_ready(item_index)
+                    ]
+                    if not ready_indices:
+                        continue
+
+                    ready_index_set = set(ready_indices)
+                    pending_base_indices = [
+                        item_index for item_index in pending_base_indices if item_index not in ready_index_set
+                    ]
+
+                    for item_index in ready_indices:
+                        sample = self._lance_delta_sample(waiting_buffer[item_index], waiting_buffer)
+                        if include_worker_id:
+                            sample["worker_id"] = worker_id
+
+                        while len(pending_frames) >= max_pending_frames:
+                            for out_frame in pop_finished_frames(block=True):
+                                yield out_frame
+                        for out_frame in pop_finished_frames(block=False):
+                            yield out_frame
+
+                        if len(frames_buffer) == self.buffer_size:
+                            i = next_unlocked_buffer_index(buffer_indices_generator)
+                            locked_buffer_ids.add(i)
+                            try:
+                                out_sample = frames_buffer[i]
+                                frames_buffer[i] = sample
+                            finally:
+                                locked_buffer_ids.remove(i)
+                            submit_torch_frame(make_torch_executor, out_sample, i)
+                        else:
+                            frames_buffer.append(sample)
+
+                    if max_negative_delta > 0:
+                        min_needed_index = (
+                            min(pending_base_indices) - max_negative_delta
+                            if pending_base_indices
+                            else read_stop
+                        )
+                        for old_index in list(waiting_buffer.keys()):
+                            if old_index < min_needed_index:
+                                del waiting_buffer[old_index]
+
+                rng.shuffle(frames_buffer)
+                if len(frames_buffer) == 0:
+                    raise RuntimeError("Failed to load any frames from the Lance streaming dataset.")
+
+                for out_sample in frames_buffer:
+                    while len(pending_frames) >= max_pending_frames:
+                        for out_frame in pop_finished_frames(block=True):
+                            yield out_frame
+
+                    submit_torch_frame(make_torch_executor, out_sample, None)
+
+                    for out_frame in pop_finished_frames(block=False):
+                        yield out_frame
+
+                while len(pending_frames) > 0:
+                    for out_frame in pop_finished_frames(block=True):
+                        yield out_frame
+
+    def record_batch_gpu_order(self, batch: dict, batch_index: int):
+        if self.shuffle_output_recorder is None:
+            self.shuffle_output_recorder = ShuffleOutputRecorder(
+                enable=True,
+                output_dir="outputs/shuffle_debug",
+                filename_prefix=f"shuffle_buffer{self.buffer_size}_shards{self.max_num_shards}_gpu_batches",
+                max_points=200_000,
+                index_key="index",
+                worker_id_key="worker_id",
+            )
+
+        self.shuffle_output_recorder.record_batch(batch, batch_index)
             
     def _get_window_steps(
         self, delta_timestamps: dict[str, list[float]] | None = None, dynamic_bounds: bool = False
@@ -543,78 +893,125 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         return padding_mask
 
-    def make_frame(self, dataset_iterator: Backtrackable) -> Generator:
-        """Makes a frame starting from a dataset iterator"""
-        with torch.profiler.record_function("dataloader_parquet_read"):
-            item = next(dataset_iterator)
-            item = item_to_torch(item)
+    def get_sample(self, dataset_iterator: Backtrackable) -> dict:
+        """Reads a raw sample and applies non-video delta queries before shuffle buffering."""
+        with torch.profiler.record_function("dataloader_streaming_get_sample"), dataloader_trace(
+            "dataloader_streaming_get_sample"
+        ):
+            with torch.profiler.record_function("dataloader_parquet_read"), dataloader_trace(
+                "dataloader_parquet_read"
+            ):
+                item = next(dataset_iterator)
 
-        updates = []  # list of "updates" to apply to the item retrieved from hf_dataset (w/o camera features)
+            updates = []  # list of "updates" to apply to the item retrieved from hf_dataset (w/o camera features)
 
-        # Get episode index from the item
-        ep_idx = item["episode_index"]
+            # Get episode index from the item
+            ep_idx = item["episode_index"]
 
-        # "timestamp" restarts from 0 for each episode, whereas we need a global timestep within the single .mp4 file (given by index/fps)
-        current_ts = item["index"] / self.fps
+            # "timestamp" restarts from 0 for each episode, whereas we need a global timestep within the single .mp4 file (given by index/fps)
+            current_ts = item["index"] / self.fps
 
-        episode_boundaries_ts = {
-            key: (
-                self.meta.episodes[ep_idx][f"videos/{key}/from_timestamp"],
-                self.meta.episodes[ep_idx][f"videos/{key}/to_timestamp"],
-            )
-            for key in self.meta.video_keys
-        }
-
-        # Apply delta querying logic if necessary
-        if self.delta_indices is not None:
-            query_result, padding = self._get_delta_frames(dataset_iterator, item)
-            updates.append(query_result)
-            updates.append(padding)
-
-        # Load video frames, when needed
-        if len(self.meta.video_keys) > 0:
-            original_timestamps = self._make_timestamps_from_indices(current_ts, self.delta_indices)
-
-            # Some timestamps might not result available considering the episode's boundaries
-            query_timestamps = self._get_query_timestamps(
-                current_ts, self.delta_indices, episode_boundaries_ts
-            )
-
-            video_frames = self._query_videos(query_timestamps, ep_idx)
-
-            if self.image_transforms is not None:
-                with torch.profiler.record_function("dataloader_image_transforms"):
-                    image_keys = self.meta.camera_keys
-                    for cam in image_keys:
-                        video_frames[cam] = self.image_transforms(video_frames[cam])
-
-            updates.append(video_frames)
-
-            if self.delta_indices is not None:
-                # We always return the same number of frames. Unavailable frames are padded.
-                padding_mask = self._get_video_frame_padding_mask(
-                    video_frames, query_timestamps, original_timestamps
+            episode_boundaries_ts = {
+                key: (
+                    self.meta.episodes[ep_idx][f"videos/{key}/from_timestamp"],
+                    self.meta.episodes[ep_idx][f"videos/{key}/to_timestamp"],
                 )
-                updates.append(padding_mask)
+                for key in self.meta.video_keys
+            }
 
-        result = item.copy()
-        for update in updates:
-            result.update(update)
+            # Apply delta querying logic if necessary
+            if self.delta_indices is not None:
+                with torch.profiler.record_function("dataloader_delta_hf_query"), dataloader_trace(
+                    "dataloader_delta_hf_query"
+                ):
+                    query_result, padding = self._get_delta_frames(dataset_iterator, item)
+                updates.append(query_result)
+                updates.append(padding)
 
-        # Keep original dataset index for shuffle-buffer visualization
-        result["index"] = item["index"]
+            result = item.copy()
+            for update in updates:
+                result.update(update)
 
-        # Keep 'task' as string - this will be handled specially in collate
-        task_index = item["task_index"]
-        if isinstance(task_index, torch.Tensor):
-            task_index = int(task_index.item())
-        else:
-            task_index = int(task_index)
+            # Keep original dataset index for shuffle-buffer visualization
+            result["index"] = item["index"]
 
-        result["task_index"] = task_index
-        result["task"] = self.meta.tasks.iloc[task_index].name
+        return result
 
-        yield result
+    def make_torch_frame(self, sample: dict) -> dict:
+        """Decodes video fields and converts a shuffled raw sample to tensors."""
+        with torch.profiler.record_function("dataloader_streaming_make_torch_frame"), dataloader_trace(
+            "dataloader_streaming_make_torch_frame"
+        ):
+            updates = []
+
+            # Get episode index from the item
+            ep_idx = sample["episode_index"]
+
+            # "timestamp" restarts from 0 for each episode, whereas we need a global timestep within the single .mp4 file (given by index/fps)
+            current_ts = sample["index"] / self.fps
+
+            episode_boundaries_ts = {
+                key: (
+                    self.meta.episodes[ep_idx][f"videos/{key}/from_timestamp"],
+                    self.meta.episodes[ep_idx][f"videos/{key}/to_timestamp"],
+                )
+                for key in self.meta.video_keys
+            }
+
+            # Load video frames, when needed
+            if len(self.meta.video_keys) > 0:
+                with torch.profiler.record_function("dataloader_video_timestamp_lookup"), dataloader_trace(
+                    "dataloader_video_timestamp_lookup"
+                ):
+                    original_timestamps = self._make_timestamps_from_indices(current_ts, self.delta_indices)
+
+                    # Some timestamps might not result available considering the episode's boundaries
+                    query_timestamps = self._get_query_timestamps(
+                        current_ts, self.delta_indices, episode_boundaries_ts
+                    )
+
+                video_frames = self._query_videos(query_timestamps, ep_idx)
+
+                if self.image_transforms is not None:
+                    with torch.profiler.record_function("dataloader_image_transforms"), dataloader_trace(
+                        "dataloader_image_transforms"
+                    ):
+                        image_keys = self.meta.camera_keys
+                        for cam in image_keys:
+                            video_frames[cam] = self.image_transforms(video_frames[cam])
+
+                updates.append(video_frames)
+
+                if self.delta_indices is not None:
+                    # We always return the same number of frames. Unavailable frames are padded.
+                    padding_mask = self._get_video_frame_padding_mask(
+                        video_frames, query_timestamps, original_timestamps
+                    )
+                    updates.append(padding_mask)
+
+            result = sample.copy()
+            for update in updates:
+                result.update(update)
+
+            # Keep 'task' as string - this will be handled specially in collate
+            task_index = sample["task_index"]
+            if isinstance(task_index, torch.Tensor):
+                task_index = int(task_index.item())
+            else:
+                task_index = int(task_index)
+
+            result["task_index"] = task_index
+            result["task"] = self.meta.tasks.iloc[task_index].name
+            result = item_to_torch(result)
+
+        return result
+
+    def make_frame(self, dataset_iterator: Backtrackable) -> Generator:
+        """Makes a tensor frame starting from a dataset iterator."""
+        with torch.profiler.record_function("dataloader_streaming_make_frame"), dataloader_trace(
+            "dataloader_streaming_make_frame"
+        ):
+            yield self.make_torch_frame(self.get_sample(dataset_iterator))
 
     def _get_query_timestamps(
         self,
@@ -669,7 +1066,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
             # Use the specified video backend (pyav or torchcodec)
             try:
-                with torch.profiler.record_function("dataloader_video_decode"):
+                with torch.profiler.record_function("dataloader_video_decode"), dataloader_trace(
+                    "dataloader_video_decode"
+                ):
                     frames = decode_video_frames(
                         video_path, query_ts, self.tolerance_s, backend=self.video_backend
                     )
@@ -735,7 +1134,6 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                     steps_back = abs(delta)
                     if dataset_iterator.can_peek_back(steps_back):
                         past_item = dataset_iterator.peek_back(steps_back)
-                        past_item = item_to_torch(past_item)
 
                         if past_item["episode_index"] == current_episode_idx:
                             delta_results[delta] = (past_item[key], False)
@@ -762,7 +1160,6 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 try:
                     if dataset_iterator.can_peek_ahead(delta):
                         future_item = dataset_iterator.peek_ahead(delta)
-                        future_item = item_to_torch(future_item)
 
                         if future_item["episode_index"] == current_episode_idx:
                             delta_results[delta] = (future_item[key], False)
@@ -785,10 +1182,10 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 target_frames.append(frame)  # frame.unsqueeze(0))
                 is_pad.append(is_padded)
 
-            # Stack frames and add to results
+            # Keep raw frame values here; make_frame converts the merged result in one pass.
             if target_frames:
-                query_result[key] = torch.stack(target_frames)
-                padding[f"{key}_is_pad"] = torch.BoolTensor(is_pad)
+                query_result[key] = target_frames
+                padding[f"{key}_is_pad"] = is_pad
 
         return query_result, padding
 

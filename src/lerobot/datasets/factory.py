@@ -114,6 +114,8 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 max_num_shards=max_num_shards,
                 tolerance_s=cfg.tolerance_s,
                 buffer_size=cfg.dataset.shuffle_buffer_size,
+                raw_batch_size=cfg.dataset.raw_batch_size,
+                lance_decode_device=cfg.dataset.lance_decode_device,
                 seed=cfg.dataset.seed if cfg.dataset.seed is not None else 42,
                 video_backend=cfg.dataset.video_backend,
             )
