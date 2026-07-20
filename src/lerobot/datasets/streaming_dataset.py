@@ -13,11 +13,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib
 import os
 import sys
 from collections import deque
 from collections.abc import Callable, Generator, Iterable, Iterator
 from pathlib import Path
+from types import ModuleType
 
 import datasets
 import numpy as np
@@ -392,26 +394,37 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     def _make_lance_dataset(self):
         """Load the optional Lance adapter without making it a core LeRobot dependency."""
         try:
-            from lerobot_lancedb import RandomDeltaWindowLancePerfectIO
-        except ModuleNotFoundError:
+            module = importlib.import_module("lerobot_lancedb")
+            reader_cls = module.RandomDeltaWindowLancePerfectIO
+        except (ImportError, RuntimeError) as import_error:
             configured_src = os.environ.get("LEROBOT_LANCEDB_SRC")
             candidates = [
                 Path(configured_src) if configured_src else None,
                 Path.home() / "lerobot_lancedb" / "src",
                 Path.home() / "dataloader" / "lerobot_lancedb" / "src",
             ]
+            package_dir = None
             for candidate in candidates:
-                if candidate is not None and candidate.exists() and str(candidate) not in sys.path:
-                    sys.path.insert(0, str(candidate))
-            try:
-                from lerobot_lancedb import RandomDeltaWindowLancePerfectIO
-            except ModuleNotFoundError as exc:
+                if candidate is not None and (candidate / "lerobot_lancedb").is_dir():
+                    package_dir = candidate / "lerobot_lancedb"
+                    break
+            if package_dir is None:
                 raise ModuleNotFoundError(
                     "A Lance dataset root was selected, but lerobot_lancedb is not installed. "
                     "Install the adapter or set LEROBOT_LANCEDB_SRC to its src directory."
-                ) from exc
+                ) from import_error
 
-        return RandomDeltaWindowLancePerfectIO(
+            # The adapter's top-level package also imports its optional video reader. On machines
+            # without a TorchCodec-compatible FFmpeg, load only the JPEG Lance reader submodule so
+            # the independent random-batch path remains available.
+            package = ModuleType("lerobot_lancedb")
+            package.__path__ = [str(package_dir)]
+            package.__package__ = "lerobot_lancedb"
+            sys.modules["lerobot_lancedb"] = package
+            module = importlib.import_module("lerobot_lancedb.random_deltawindow_lance")
+            reader_cls = module.RandomDeltaWindowLancePerfectIO
+
+        return reader_cls(
             root=self.root,
             delta_timestamps=self.delta_timestamps,
             image_transforms=self.image_transforms,
