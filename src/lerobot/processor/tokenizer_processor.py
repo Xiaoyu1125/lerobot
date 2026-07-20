@@ -29,7 +29,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
+from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
+from lerobot.types import EnvTransition, RobotObservation, TransitionKey
 from lerobot.utils.constants import (
     ACTION_TOKEN_MASK,
     ACTION_TOKENS,
@@ -40,7 +41,6 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.import_utils import _transformers_available
 
-from .core import EnvTransition, RobotObservation, TransitionKey
 from .pipeline import ActionProcessorStep, ObservationProcessorStep, ProcessorStepRegistry
 
 # Conditional import for type checking and lazy loading
@@ -78,7 +78,6 @@ class TokenizerProcessorStep(ObservationProcessorStep):
     tokenizer: Any | None = None  # Use `Any` for compatibility without a hard dependency
     max_length: int = 512
     task_key: str = "task"
-    task_strings: list[str] | None = None  # Optional list of task strings for looking up from task_index
     padding_side: str = "right"
     padding: str = "max_length"
     truncation: bool = True
@@ -130,38 +129,15 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         if complementary_data is None:
             raise ValueError("Complementary data is None so no task can be extracted from it")
 
-        task = complementary_data.get(self.task_key)
-        
-        # If task is None but we have task_strings and task_index, look up the task
-        if task is None and self.task_strings is not None:
-            task_index = complementary_data.get("task_index")
-            if task_index is not None:
-                # Handle tensor or int
-                if hasattr(task_index, 'item'):
-                    # It's a tensor
-                    if task_index.numel() == 1:
-                        # Single sample
-                        idx = task_index.item()
-                        if 0 <= idx < len(self.task_strings):
-                            return [self.task_strings[idx]]
-                    else:
-                        # Batch of samples - return list of tasks
-                        tasks = []
-                        for idx in task_index.cpu().numpy():
-                            if 0 <= idx < len(self.task_strings):
-                                tasks.append(self.task_strings[idx])
-                        return tasks if tasks else None
-                elif isinstance(task_index, int) and 0 <= task_index < len(self.task_strings):
-                    return [self.task_strings[task_index]]
-        
+        task = complementary_data[self.task_key]
         if task is None:
             raise ValueError("Task extracted from Complementary data is None")
 
         # Standardize to a list of strings for the tokenizer
         if isinstance(task, str):
             return [task]
-        elif isinstance(task, list) and all(isinstance(t, str) for t in task):
-            return task
+        elif isinstance(task, (list, tuple)) and all(isinstance(t, str) for t in task):
+            return list(task)
 
         return None
 
@@ -360,7 +336,7 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
     Requires the `transformers` library to be installed.
 
     Attributes:
-        tokenizer_name: The name of a pretrained processor from the Hugging Face Hub (e.g., "physical-intelligence/fast").
+        tokenizer_name: The name of a pretrained processor from the Hugging Face Hub (e.g., "lerobot/fast-action-tokenizer").
         tokenizer: A pre-initialized processor/tokenizer object. If provided, `tokenizer_name` is ignored.
         trust_remote_code: Whether to trust remote code when loading the tokenizer (required for some tokenizers).
         action_tokenizer: The internal tokenizer/processor instance, loaded during initialization.
